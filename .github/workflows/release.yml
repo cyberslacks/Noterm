@@ -1,0 +1,118 @@
+name: Release
+
+# Trigger by pushing a version tag: git tag v0.1.0 && git push --tags
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — fully static via musl (runs on any Linux, no glibc version constraint)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: noterm-linux-x86_64
+            install_musl: true
+
+          # macOS Apple Silicon (M1/M2/M3)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: noterm-macos-arm64
+
+          # macOS Intel
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: noterm-macos-x86_64
+
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: noterm-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain (Linux static build)
+        if: matrix.install_musl
+        run: sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/noterm ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+          tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/noterm.exe ${{ matrix.artifact }}
+          Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: ignore
+
+  # Combine macOS Intel + ARM into a universal binary, then publish all to GitHub Releases
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create macOS universal binary
+        run: |
+          tar -xzf artifacts/noterm-macos-arm64/noterm-macos-arm64.tar.gz
+          tar -xzf artifacts/noterm-macos-x86_64/noterm-macos-x86_64.tar.gz
+          lipo -create noterm-macos-arm64 noterm-macos-x86_64 -output noterm-macos-universal
+          chmod +x noterm-macos-universal
+          tar -czf noterm-macos-universal.tar.gz noterm-macos-universal
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/noterm-linux-x86_64/noterm-linux-x86_64.tar.gz
+            artifacts/noterm-macos-arm64/noterm-macos-arm64.tar.gz
+            artifacts/noterm-macos-x86_64/noterm-macos-x86_64.tar.gz
+            noterm-macos-universal.tar.gz
+            artifacts/noterm-windows-x86_64.exe/noterm-windows-x86_64.exe.zip

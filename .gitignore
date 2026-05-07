@@ -1,0 +1,28 @@
+# Rust build artifacts — never commit these (can be hundreds of MB)
+/target
+
+# Local Claude Code settings (permissions, hooks)
+.claude/
+
+# Environment files — may contain API keys
+.env
+.env.*
+!.env.example
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Log files (noterm writes to ~/.local/share/noterm/noterm.log, not here)
+*.log
