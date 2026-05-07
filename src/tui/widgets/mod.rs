@@ -1,0 +1,12 @@
+pub mod chat_panel;
+pub mod confirm_delete;
+pub mod editor;
+pub mod file_tree;
+pub mod git_panel;
+pub mod help_popup;
+pub mod kanban;
+pub mod meetily_panel;
+pub mod search_overlay;
+pub mod status_bar;
+pub mod vector_search;
+pub mod viewer;

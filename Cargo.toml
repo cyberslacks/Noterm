@@ -1,0 +1,65 @@
+[package]
+name = "noterm"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal-native Markdown note-taking with LLM, search, git, and kanban"
+
+[[bin]]
+name = "noterm"
+path = "src/main.rs"
+
+[dependencies]
+# TUI
+ratatui = "0.30"
+ratatui-textarea = "0.9"
+crossterm = { version = "0.29", features = ["event-stream"] }
+tui-popup = "0.6"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# HTTP — reqwest 0.12 uses rustls by default (no openssl-dev required)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Git — vendored compiles libgit2 from source so the binary has no system libgit2 dep
+git2 = { version = "0.19", features = ["vendored-libgit2"] }
+
+# Full-text search
+tantivy = "0.22"
+
+# SQLite — bundled feature statically links libsqlite3
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Markdown + frontmatter
+pulldown-cmark = "0.11"
+gray_matter = "0.2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+
+# Utilities
+anyhow = "1"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# Import API server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Logging — file only, never stdout (stdout breaks TUI)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
