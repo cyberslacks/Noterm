@@ -61,6 +61,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, _state: &AppState) {
         ("", ""),
         ("I", "Meetily import panel"),
         ("S", "Settings (LLM provider, models, API keys)"),
+        ("X", "Generate AI summary of current note (insert into ## Summary)"),
         ("q / Ctrl+q", "Quit noterm"),
     ];
 

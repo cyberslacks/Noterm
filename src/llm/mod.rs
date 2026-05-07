@@ -2,6 +2,7 @@ pub mod claude;
 pub mod ollama;
 pub mod openai;
 pub mod context;
+pub mod summarizer;
 
 use anyhow::Result;
 use async_trait::async_trait;

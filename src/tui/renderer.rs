@@ -4,7 +4,8 @@ use super::{
     layout,
     widgets::{
         chat_panel, confirm_delete, editor, file_tree, git_panel, help_popup, kanban,
-        meetily_panel, search_overlay, settings_panel, status_bar, vector_search, viewer,
+        meetily_panel, search_overlay, settings_panel, status_bar, summary_panel, vector_search,
+        viewer,
     },
 };
 use crate::app::{AppState, Mode};
@@ -51,6 +52,7 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Mode::ConfirmDelete => confirm_delete::render(f, area, state),
         Mode::MeetilyImport => meetily_panel::render(f, area, state),
         Mode::Settings => settings_panel::render(f, area, state),
+        Mode::Summarize => summary_panel::render(f, area, state),
         _ => {}
     }
 }

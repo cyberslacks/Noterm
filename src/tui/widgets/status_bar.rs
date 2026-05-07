@@ -24,6 +24,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::ConfirmDelete => ("DELETE?", Color::Red),
         Mode::MeetilyImport => ("MEETILY", Color::Cyan),
         Mode::Settings => ("SETTINGS", Color::Cyan),
+        Mode::Summarize => ("SUMMARIZE", Color::LightMagenta),
     };
 
     let left = Line::from(vec![

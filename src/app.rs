@@ -27,6 +27,7 @@ pub enum Mode {
     ConfirmDelete,  // confirmation overlay before deleting a note
     MeetilyImport,  // Meetily meeting browser overlay
     Settings,       // LLM / provider settings panel
+    Summarize,      // streaming AI summary overlay
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +35,7 @@ pub enum SettingsMode {
     Navigating,
     EditingText,
     PickingModel,
+    EditingLongText, // full-screen textarea for multi-line fields (e.g. system prompt)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +71,9 @@ pub enum AppEvent {
     MeetilyImportDone { path: PathBuf, meetily_id: String },
     ModelsLoaded { ollama: Vec<String>, openai: Vec<String> },
     ForceReembed,
+    SummaryChunk(String),
+    SummaryDone,
+    SummaryError(String),
     Error(String),
 }
 
@@ -147,6 +152,12 @@ pub struct AppState {
     pub settings_model_cursor: usize,
     pub available_ollama_models: Vec<String>,
     pub available_openai_models: Vec<String>,
+    pub settings_prompt_editor: TextArea<'static>,
+
+    // Summarize panel
+    pub summarize_loading: bool,
+    pub summarize_buf: String,
+    pub summarize_scroll: usize,
 
     // Status bar notification
     pub status_message: Option<(String, StatusLevel)>,
@@ -193,6 +204,10 @@ impl AppState {
             settings_model_cursor: 0,
             available_ollama_models: Vec::new(),
             available_openai_models: Vec::new(),
+            settings_prompt_editor: TextArea::default(),
+            summarize_loading: false,
+            summarize_buf: String::new(),
+            summarize_scroll: 0,
             status_message: None,
             config,
             tx,
@@ -330,6 +345,27 @@ impl AppState {
                 // handled in main event loop before reaching here
             }
 
+            AppEvent::SummaryChunk(token) => {
+                self.summarize_buf.push_str(&token);
+            }
+
+            AppEvent::SummaryDone => {
+                self.summarize_loading = false;
+                match self.insert_summary_into_note() {
+                    Ok(true) => self.set_status("Summary inserted into note".into(), StatusLevel::Success),
+                    Ok(false) => {}
+                    Err(e) => self.set_status(format!("Summary insert failed: {e}"), StatusLevel::Error),
+                }
+            }
+
+            AppEvent::SummaryError(e) => {
+                self.summarize_loading = false;
+                self.set_status(format!("Summarizer: {e}"), StatusLevel::Error);
+                if self.mode == Mode::Summarize {
+                    self.mode = Mode::Normal;
+                }
+            }
+
             AppEvent::Error(e) => {
                 self.set_status(e, StatusLevel::Error);
             }
@@ -342,6 +378,45 @@ impl AppState {
 
     pub fn clear_status(&mut self) {
         self.status_message = None;
+    }
+
+    /// Insert `summarize_buf` into the note's `## Summary` section (or prepend one).
+    /// Returns Ok(true) if a note was open and the write succeeded.
+    pub fn insert_summary_into_note(&mut self) -> anyhow::Result<bool> {
+        let summary = self.summarize_buf.clone();
+        if summary.is_empty() {
+            return Ok(false);
+        }
+        let note = match self.current_note.as_mut() {
+            Some(n) => n,
+            None => return Ok(false),
+        };
+
+        let new_body = inject_summary_into_body(&note.body, &summary);
+
+        // Extract action items from the summary and merge into frontmatter tasks.
+        let new_tasks = extract_tasks_from_summary(&summary);
+        if !new_tasks.is_empty() {
+            let relative_path = note.relative_path.clone();
+            let existing = note.frontmatter.tasks.get_or_insert_with(Vec::new);
+            for mut task in new_tasks {
+                task.note_path = relative_path.clone();
+                if !existing.iter().any(|e| e.title == task.title) {
+                    existing.push(task);
+                }
+            }
+        }
+
+        note.body = new_body.clone();
+        note.raw = crate::notes::frontmatter::serialize(&note.frontmatter, &new_body);
+        std::fs::write(&note.path, &note.raw)?;
+        self.is_modified = false;
+
+        // Keep the editor in sync with the updated body
+        let lines: Vec<String> = note.body.lines().map(String::from).collect();
+        self.editor = ratatui_textarea::TextArea::new(lines);
+
+        Ok(true)
     }
 
     pub fn selected_file_node(&self) -> Option<&FileNode> {
@@ -392,5 +467,96 @@ impl AppState {
     pub fn return_to_previous(&mut self) {
         let prev = self.previous_mode.clone();
         self.mode = prev;
+    }
+}
+
+/// Parse `- [ ] ...` lines from the `## Next Steps` section of a generated summary.
+/// Each line becomes a `Task` with status `Todo`. Lines like "None identified." are skipped.
+fn extract_tasks_from_summary(summary: &str) -> Vec<crate::tasks::Task> {
+    let mut tasks = Vec::new();
+    let mut in_next_steps = false;
+
+    for line in summary.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.eq_ignore_ascii_case("## next steps") || trimmed.starts_with("## Next Steps") {
+            in_next_steps = true;
+            continue;
+        }
+
+        // Any `## ` sibling (not `### ` sub-section) closes the section.
+        if in_next_steps && trimmed.starts_with("## ") && !trimmed.starts_with("### ") {
+            break;
+        }
+
+        if in_next_steps {
+            if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+                // Strip the ` — Owner: ...` suffix generated by the system prompt.
+                let title = rest
+                    .splitn(2, " — Owner:")
+                    .next()
+                    .unwrap_or(rest)
+                    .trim()
+                    .to_string();
+
+                if title.is_empty() || title.eq_ignore_ascii_case("none identified.") {
+                    continue;
+                }
+
+                tasks.push(crate::tasks::Task {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    title,
+                    description: None,
+                    status: crate::tasks::TaskStatus::Todo,
+                    priority: None,
+                    due: None,
+                    tags: Some(vec!["summary".into()]),
+                    note_path: String::new(), // filled in by caller
+                });
+            }
+        }
+    }
+
+    tasks
+}
+
+/// Replace the `## Summary` section of `body` with `summary_text`, or prepend one.
+fn inject_summary_into_body(body: &str, summary_text: &str) -> String {
+    // Locate a "## Summary" (case-insensitive) at the start of a line.
+    let lower = body.to_lowercase();
+    let search = "## summary";
+
+    let section_start = lower.find(search).filter(|&pos| {
+        // Must be at the start of a line (pos == 0 or preceded by '\n')
+        pos == 0 || body.as_bytes().get(pos - 1) == Some(&b'\n')
+    });
+
+    if let Some(start) = section_start {
+        // Find where this section ends: next "## " at the same depth, or EOF.
+        let after_heading = start + search.len();
+        let rest = &body[after_heading..];
+        let section_end = rest.find("\n## ")
+            .map(|p| after_heading + p)     // keep the '\n' so next heading stays on its own line
+            .unwrap_or(body.len());
+
+        let before = body[..start].trim_end_matches('\n');
+        let after = body[section_end..].trim_start_matches('\n');
+
+        if before.is_empty() && after.is_empty() {
+            format!("## Summary\n\n{summary_text}\n")
+        } else if before.is_empty() {
+            format!("## Summary\n\n{summary_text}\n\n{after}")
+        } else if after.is_empty() {
+            format!("{before}\n\n## Summary\n\n{summary_text}\n")
+        } else {
+            format!("{before}\n\n## Summary\n\n{summary_text}\n\n{after}")
+        }
+    } else {
+        // No Summary section — prepend one before the body content.
+        if body.trim().is_empty() {
+            format!("## Summary\n\n{summary_text}\n")
+        } else {
+            format!("## Summary\n\n{summary_text}\n\n---\n\n{}", body.trim_start())
+        }
     }
 }

@@ -42,6 +42,7 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<Action> {
         Mode::ConfirmDelete => handle_confirm_delete(state, key).await,
         Mode::MeetilyImport => handle_meetily(state, key).await,
         Mode::Settings => handle_settings(state, key),
+        Mode::Summarize => handle_summarize(state, key),
     }
 }
 
@@ -163,11 +164,47 @@ async fn handle_normal(state: &mut AppState, key: KeyEvent) -> Result<Action> {
                 });
             }
         }
+        KeyCode::Char('X') => {
+            if state.current_note.is_some() {
+                state.summarize_loading = true;
+                state.summarize_buf.clear();
+                state.summarize_scroll = 0;
+                state.enter_mode(Mode::Summarize);
+                // The main event loop detects summarize_loading and spawns the task.
+            } else {
+                state.set_status("Open a note first".into(), crate::app::StatusLevel::Warning);
+            }
+        }
         KeyCode::PageDown => {
             state.viewer_scroll = state.viewer_scroll.saturating_add(10);
         }
         KeyCode::PageUp => {
             state.viewer_scroll = state.viewer_scroll.saturating_sub(10);
+        }
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+fn handle_summarize(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    match key.code {
+        KeyCode::Esc => {
+            // Close the overlay; if generation already finished the summary was
+            // already inserted on SummaryDone. If still loading, abandon it.
+            state.summarize_loading = false;
+            state.mode = Mode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.summarize_scroll = state.summarize_scroll.saturating_add(3);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.summarize_scroll = state.summarize_scroll.saturating_sub(3);
+        }
+        KeyCode::PageDown => {
+            state.summarize_scroll = state.summarize_scroll.saturating_add(20);
+        }
+        KeyCode::PageUp => {
+            state.summarize_scroll = state.summarize_scroll.saturating_sub(20);
         }
         _ => {}
     }
@@ -417,14 +454,15 @@ fn handle_git(state: &mut AppState, key: KeyEvent) -> Result<Action> {
             let tx = state.tx.clone();
             let notes_dir = state.notes_dir.clone();
             let remote = state.config.git.remote.clone().unwrap_or_else(|| "origin".into());
+            let git_username = state.config.git.git_username.clone();
+            let git_token = state.config.git.git_token.clone();
             state.git_loading = true;
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    // Detect current branch
                     let repo = git2::Repository::open(&notes_dir)?;
                     let branch = repo.head()?.shorthand().unwrap_or("main").to_string();
                     drop(repo);
-                    crate::git::operations::push(&notes_dir, &remote, &branch)
+                    crate::git::operations::push(&notes_dir, &remote, &branch, git_username, git_token)
                 })
                 .await;
                 let mapped = match result {
@@ -439,12 +477,14 @@ fn handle_git(state: &mut AppState, key: KeyEvent) -> Result<Action> {
             let tx = state.tx.clone();
             let notes_dir = state.notes_dir.clone();
             let remote = state.config.git.remote.clone().unwrap_or_else(|| "origin".into());
+            let git_username = state.config.git.git_username.clone();
+            let git_token = state.config.git.git_token.clone();
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     let repo = git2::Repository::open(&notes_dir)?;
                     let branch = repo.head()?.shorthand().unwrap_or("main").to_string();
                     drop(repo);
-                    crate::git::operations::pull(&notes_dir, &remote, &branch)
+                    crate::git::operations::pull(&notes_dir, &remote, &branch, git_username, git_token)
                 })
                 .await;
                 let mapped = match result {
@@ -659,6 +699,7 @@ fn handle_settings(state: &mut AppState, key: KeyEvent) -> Result<Action> {
         SettingsMode::Navigating => handle_settings_nav(state, key),
         SettingsMode::EditingText => handle_settings_edit(state, key),
         SettingsMode::PickingModel => handle_settings_pick(state, key),
+        SettingsMode::EditingLongText => handle_settings_edit_long(state, key),
     }
 }
 
@@ -694,6 +735,17 @@ fn handle_settings_nav(state: &mut AppState, key: KeyEvent) -> Result<Action> {
             } else if sp::is_model_field(state.settings_cursor) {
                 state.settings_model_cursor = 0;
                 state.settings_mode = SettingsMode::PickingModel;
+            } else if state.settings_cursor == sp::FIELD_SUMMARIZER_PROMPT {
+                // Open full textarea editor for the system prompt.
+                let lines: Vec<String> = state
+                    .config
+                    .summarizer
+                    .system_prompt
+                    .lines()
+                    .map(String::from)
+                    .collect();
+                state.settings_prompt_editor = ratatui_textarea::TextArea::new(lines);
+                state.settings_mode = SettingsMode::EditingLongText;
             } else {
                 // Text edit mode: populate edit buf with current raw value
                 state.settings_edit_buf = sp::get_field_raw(state, state.settings_cursor);
@@ -766,6 +818,33 @@ fn handle_settings_pick(state: &mut AppState, key: KeyEvent) -> Result<Action> {
             state.settings_mode = SettingsMode::Navigating;
         }
         _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+fn handle_settings_edit_long(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    match key.code {
+        KeyCode::Esc => {
+            // Save prompt content back to config and return to settings nav.
+            let prompt = state.settings_prompt_editor.lines().join("\n");
+            state.config.summarizer.system_prompt = prompt;
+            state.settings_mode = SettingsMode::Navigating;
+        }
+        _ => {
+            // Ctrl+s also saves without closing.
+            if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('s')
+            {
+                let prompt = state.settings_prompt_editor.lines().join("\n");
+                state.config.summarizer.system_prompt = prompt;
+                state.config.write().ok();
+                state.set_status("Prompt saved".into(), crate::app::StatusLevel::Success);
+            } else {
+                state
+                    .settings_prompt_editor
+                    .input(crossterm::event::Event::Key(key));
+            }
+        }
     }
     Ok(Action::Continue)
 }

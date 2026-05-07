@@ -1,7 +1,6 @@
 use super::{GitCommit, GitStatus};
 use anyhow::Result;
-use std::path::{Path, PathBuf};
-use tokio::sync::mpsc::UnboundedSender;
+use std::path::Path;
 
 // All git2 operations must run in spawn_blocking because git2::Repository is not Send.
 
@@ -98,34 +97,36 @@ pub fn commit(repo_path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn push(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
+pub fn push(
+    repo_path: &Path,
+    remote: &str,
+    branch: &str,
+    git_username: Option<String>,
+    git_token: Option<String>,
+) -> Result<()> {
     let repo = git2::Repository::open(repo_path)?;
     let mut remote = repo.find_remote(remote)?;
 
-    let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(|_url, username, _allowed| {
-        git2::Cred::ssh_key_from_agent(username.unwrap_or("git"))
-    });
-
     let mut push_opts = git2::PushOptions::new();
-    push_opts.remote_callbacks(callbacks);
+    push_opts.remote_callbacks(make_callbacks(git_username, git_token));
 
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
     remote.push(&[refspec.as_str()], Some(&mut push_opts))?;
     Ok(())
 }
 
-pub fn pull(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
+pub fn pull(
+    repo_path: &Path,
+    remote: &str,
+    branch: &str,
+    git_username: Option<String>,
+    git_token: Option<String>,
+) -> Result<()> {
     let repo = git2::Repository::open(repo_path)?;
     let mut remote_obj = repo.find_remote(remote)?;
 
-    let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(|_url, username, _allowed| {
-        git2::Cred::ssh_key_from_agent(username.unwrap_or("git"))
-    });
-
     let mut fetch_opts = git2::FetchOptions::new();
-    fetch_opts.remote_callbacks(callbacks);
+    fetch_opts.remote_callbacks(make_callbacks(git_username, git_token));
     remote_obj.fetch(&[branch], Some(&mut fetch_opts), None)?;
 
     let fetch_head = repo.find_reference("FETCH_HEAD")?;
@@ -142,6 +143,62 @@ pub fn pull(repo_path: &Path, remote: &str, branch: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build a `RemoteCallbacks` with a multi-strategy credential chain:
+/// 1. HTTPS token (username + token from settings) — tried if the remote asks for user/pass
+/// 2. SSH agent — tried if the remote asks for an SSH key
+/// 3. SSH key files (~/.ssh/id_ed25519, id_rsa, id_ecdsa) without passphrase
+///
+/// The `tried` flag prevents infinite retry loops: libgit2 calls the callback again on
+/// auth failure, and returning an error on the second call terminates the loop cleanly.
+fn make_callbacks(
+    git_username: Option<String>,
+    git_token: Option<String>,
+) -> git2::RemoteCallbacks<'static> {
+    let tried = std::cell::Cell::new(false);
+
+    let mut callbacks = git2::RemoteCallbacks::new();
+    callbacks.credentials(move |_url, username, allowed_types| {
+        // Return a hard error on second call to prevent libgit2 retry loops.
+        if tried.replace(true) {
+            return Err(git2::Error::from_str(
+                "Authentication failed. Set git_username / git_token in Settings (S key).",
+            ));
+        }
+
+        let user = username.unwrap_or("git");
+
+        // HTTPS token (explicit config takes priority over SSH).
+        if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+            if let (Some(ref u), Some(ref p)) = (&git_username, &git_token) {
+                return git2::Cred::userpass_plaintext(u, p);
+            }
+        }
+
+        // SSH agent.
+        if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+            if let Ok(cred) = git2::Cred::ssh_key_from_agent(user) {
+                return Ok(cred);
+            }
+            // Fall through to key files if agent fails.
+            if let Some(home) = dirs::home_dir() {
+                for name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
+                    let path = home.join(".ssh").join(name);
+                    if path.exists() {
+                        if let Ok(cred) = git2::Cred::ssh_key(user, None, &path, None) {
+                            return Ok(cred);
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(git2::Error::from_str(
+            "No credentials found. Configure git_username / git_token in Settings (S key).",
+        ))
+    });
+    callbacks
 }
 
 fn format_time(unix: i64) -> String {

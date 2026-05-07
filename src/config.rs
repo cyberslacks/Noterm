@@ -20,6 +20,23 @@ pub struct Config {
     pub import: ImportConfig,
     #[serde(default)]
     pub meetily: MeetilyConfig,
+    #[serde(default)]
+    pub summarizer: SummarizerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummarizerConfig {
+    /// Base URL of the OpenAI-compatible API used for summarization (e.g. OpenWebUI).
+    #[serde(default = "default_summarizer_url")]
+    pub base_url: String,
+    /// Optional API key. Leave unset for local OpenWebUI with no auth.
+    pub api_key: Option<String>,
+    /// Model name to use for summarization.
+    #[serde(default = "default_summarizer_model")]
+    pub model: String,
+    /// System prompt sent to the model. Editable in Settings (S key) → Summarizer → Prompt.
+    #[serde(default = "default_summarizer_prompt")]
+    pub system_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +92,10 @@ pub struct GitConfig {
     pub auto_commit_msg: String,
     pub remote: Option<String>,
     pub branch: Option<String>,
+    /// HTTPS username (GitHub username, GitLab username, etc.)
+    pub git_username: Option<String>,
+    /// HTTPS personal access token or password used for push/pull
+    pub git_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -165,6 +186,11 @@ pub struct UiConfig {
 
 fn default_watch_interval() -> u64 { 5 }
 fn default_api_port() -> u16 { 7373 }
+fn default_summarizer_url() -> String { "http://localhost:3000/api".into() }
+fn default_summarizer_model() -> String { "llama3.2".into() }
+fn default_summarizer_prompt() -> String {
+    crate::llm::summarizer::DEFAULT_SYSTEM_PROMPT.to_string()
+}
 fn default_api_host() -> String { "127.0.0.1".into() }
 fn default_calls_folder() -> String { "calls".into() }
 fn default_call_tags() -> Vec<String> { vec!["call".into(), "meeting".into(), "meetily".into()] }
@@ -241,6 +267,8 @@ impl Default for GitConfig {
             auto_commit_msg: default_remote(),
             remote: Some("origin".into()),
             branch: None,
+            git_username: None,
+            git_token: None,
         }
     }
 }
@@ -320,6 +348,17 @@ impl Default for MeetilyConfig {
     }
 }
 
+impl Default for SummarizerConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_summarizer_url(),
+            api_key: None,
+            model: default_summarizer_model(),
+            system_prompt: default_summarizer_prompt(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -331,6 +370,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             import: ImportConfig::default(),
             meetily: MeetilyConfig::default(),
+            summarizer: SummarizerConfig::default(),
         }
     }
 }

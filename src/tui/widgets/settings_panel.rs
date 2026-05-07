@@ -10,6 +10,9 @@ use crate::app::{AppState, SettingsMode};
 use crate::config::{EmbedProvider, LlmProvider};
 use super::search_overlay::centered_rect;
 
+/// Max chars shown for the system prompt preview in the list row.
+const PROMPT_PREVIEW_LEN: usize = 55;
+
 // ── Focusable field indices ───────────────────────────────────────────────────
 
 pub const FIELD_CHAT_PROVIDER: usize = 0;
@@ -23,12 +26,22 @@ pub const FIELD_CLAUDE_API_KEY: usize = 7;
 pub const FIELD_EMBED_PROVIDER: usize = 8;
 pub const FIELD_OLLAMA_EMBED_MODEL: usize = 9;
 pub const FIELD_OPENAI_EMBED_MODEL: usize = 10;
-pub const TOTAL_FIELDS: usize = 11;
+pub const FIELD_SUMMARIZER_URL: usize = 11;
+pub const FIELD_SUMMARIZER_API_KEY: usize = 12;
+pub const FIELD_SUMMARIZER_MODEL: usize = 13;
+pub const FIELD_SUMMARIZER_PROMPT: usize = 14;
+pub const FIELD_GIT_USERNAME: usize = 15;
+pub const FIELD_GIT_TOKEN: usize = 16;
+pub const TOTAL_FIELDS: usize = 17;
 
 pub fn is_model_field(field: usize) -> bool {
     matches!(
         field,
-        FIELD_OLLAMA_CHAT_MODEL | FIELD_OPENAI_CHAT_MODEL | FIELD_OLLAMA_EMBED_MODEL | FIELD_OPENAI_EMBED_MODEL
+        FIELD_OLLAMA_CHAT_MODEL
+            | FIELD_OPENAI_CHAT_MODEL
+            | FIELD_OLLAMA_EMBED_MODEL
+            | FIELD_OPENAI_EMBED_MODEL
+            | FIELD_SUMMARIZER_MODEL
     )
 }
 
@@ -37,6 +50,7 @@ pub fn is_provider_field(field: usize) -> bool {
 }
 
 pub fn uses_ollama_models(field: usize) -> bool {
+    // Summarizer always points at an OpenAI-compat endpoint (OpenWebUI).
     matches!(field, FIELD_OLLAMA_CHAT_MODEL | FIELD_OLLAMA_EMBED_MODEL)
 }
 
@@ -54,6 +68,12 @@ pub fn get_field_raw(state: &AppState, field: usize) -> String {
         FIELD_EMBED_PROVIDER => state.config.llm.embed_provider.to_string(),
         FIELD_OLLAMA_EMBED_MODEL => state.config.llm.ollama_embed_model.clone(),
         FIELD_OPENAI_EMBED_MODEL => state.config.llm.openai_embed_model.clone(),
+        FIELD_SUMMARIZER_URL => state.config.summarizer.base_url.clone(),
+        FIELD_SUMMARIZER_API_KEY => state.config.summarizer.api_key.clone().unwrap_or_default(),
+        FIELD_SUMMARIZER_MODEL => state.config.summarizer.model.clone(),
+        FIELD_SUMMARIZER_PROMPT => state.config.summarizer.system_prompt.clone(),
+        FIELD_GIT_USERNAME => state.config.git.git_username.clone().unwrap_or_default(),
+        FIELD_GIT_TOKEN => state.config.git.git_token.clone().unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -74,6 +94,18 @@ pub fn apply_field_value(state: &mut AppState, field: usize, value: String) {
         }
         FIELD_OLLAMA_EMBED_MODEL => state.config.llm.ollama_embed_model = value,
         FIELD_OPENAI_EMBED_MODEL => state.config.llm.openai_embed_model = value,
+        FIELD_SUMMARIZER_URL => state.config.summarizer.base_url = value,
+        FIELD_SUMMARIZER_API_KEY => {
+            state.config.summarizer.api_key = if value.is_empty() { None } else { Some(value) };
+        }
+        FIELD_SUMMARIZER_MODEL => state.config.summarizer.model = value,
+        FIELD_SUMMARIZER_PROMPT => state.config.summarizer.system_prompt = value,
+        FIELD_GIT_USERNAME => {
+            state.config.git.git_username = if value.is_empty() { None } else { Some(value) };
+        }
+        FIELD_GIT_TOKEN => {
+            state.config.git.git_token = if value.is_empty() { None } else { Some(value) };
+        }
         _ => {}
     }
 }
@@ -129,10 +161,16 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
     if picker_visible {
         render_model_picker(f, h_chunks[1], state);
     }
+
+    // Prompt editor overlays the settings panel when active.
+    if state.settings_mode == SettingsMode::EditingLongText {
+        render_prompt_editor(f, area, state);
+    }
 }
 
 fn render_settings_list(f: &mut Frame, area: Rect, state: &AppState) {
     let cfg = &state.config.llm;
+    let scfg = &state.config.summarizer;
 
     struct Row {
         label: String,
@@ -158,6 +196,14 @@ fn render_settings_list(f: &mut Frame, area: Rect, state: &AppState) {
         Row { label: "  Embed Provider".into(),    value: cfg.embed_provider.to_string(),                                   field_idx: Some(FIELD_EMBED_PROVIDER),    is_header: false },
         Row { label: "  Ollama Embed Model".into(),value: cfg.ollama_embed_model.clone(),                                   field_idx: Some(FIELD_OLLAMA_EMBED_MODEL),is_header: false },
         Row { label: "  OpenAI Embed Model".into(),value: cfg.openai_embed_model.clone(),                                   field_idx: Some(FIELD_OPENAI_EMBED_MODEL),is_header: false },
+        Row { label: "── Summarizer (X key) ────────────".into(), value: String::new(), field_idx: None, is_header: true },
+        Row { label: "  URL".into(),               value: scfg.base_url.clone(),                                            field_idx: Some(FIELD_SUMMARIZER_URL),    is_header: false },
+        Row { label: "  API Key".into(),           value: mask_key(&scfg.api_key.clone().unwrap_or_default()),              field_idx: Some(FIELD_SUMMARIZER_API_KEY),is_header: false },
+        Row { label: "  Model".into(),             value: scfg.model.clone(),                                               field_idx: Some(FIELD_SUMMARIZER_MODEL),  is_header: false },
+        Row { label: "  Prompt".into(),            value: truncate_prompt(&scfg.system_prompt),                             field_idx: Some(FIELD_SUMMARIZER_PROMPT), is_header: false },
+        Row { label: "── Git Credentials (HTTPS) ────────".into(), value: String::new(), field_idx: None, is_header: true },
+        Row { label: "  Username".into(),          value: state.config.git.git_username.clone().unwrap_or_else(|| "(not set)".into()), field_idx: Some(FIELD_GIT_USERNAME), is_header: false },
+        Row { label: "  Token / Password".into(),  value: mask_key(&state.config.git.git_token.clone().unwrap_or_default()),            field_idx: Some(FIELD_GIT_TOKEN),   is_header: false },
     ];
 
     let items: Vec<ListItem> = rows
@@ -266,6 +312,30 @@ fn render_model_picker(f: &mut Frame, area: Rect, state: &AppState) {
         .collect();
 
     f.render_widget(List::new(items), inner);
+}
+
+fn render_prompt_editor(f: &mut Frame, area: Rect, state: &AppState) {
+    let popup = centered_rect(90, 90, area);
+    f.render_widget(ratatui::widgets::Clear, popup);
+
+    let block = Block::default()
+        .title(" System Prompt  (edit freely · Esc save+close · Ctrl+s save) ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    f.render_widget(&state.settings_prompt_editor, inner);
+}
+
+fn truncate_prompt(prompt: &str) -> String {
+    let first_line = prompt.lines().next().unwrap_or("").trim();
+    if first_line.len() > PROMPT_PREVIEW_LEN {
+        format!("{}…", &first_line[..PROMPT_PREVIEW_LEN])
+    } else {
+        format!("{first_line}…")
+    }
 }
 
 fn mask_key(key: &str) -> String {

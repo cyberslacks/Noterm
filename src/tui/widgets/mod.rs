@@ -9,5 +9,6 @@ pub mod meetily_panel;
 pub mod search_overlay;
 pub mod settings_panel;
 pub mod status_bar;
+pub mod summary_panel;
 pub mod vector_search;
 pub mod viewer;

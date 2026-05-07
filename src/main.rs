@@ -167,6 +167,9 @@ async fn main() -> Result<()> {
     // Track whether we've already spawned a chat task for current loading state
     let mut chat_task_spawned = false;
 
+    // Track whether we've already spawned a summarize task
+    let mut summarize_task_spawned = false;
+
     loop {
         terminal.draw(|f| tui::renderer::render(f, &mut app))?;
 
@@ -201,6 +204,22 @@ async fn main() -> Result<()> {
                 }
                 if !app.chat_loading {
                     chat_task_spawned = false;
+                }
+
+                // Trigger summarizer when loading flag is set
+                if app.summarize_loading && !summarize_task_spawned {
+                    if let Some(note) = &app.current_note {
+                        summarize_task_spawned = true;
+                        let body = note.body.clone();
+                        let summarizer_config = app.config.summarizer.clone();
+                        let tx2 = tx.clone();
+                        tokio::spawn(async move {
+                            run_summarize(body, summarizer_config, tx2).await;
+                        });
+                    }
+                }
+                if !app.summarize_loading {
+                    summarize_task_spawned = false;
                 }
 
                 // Trigger vector search
@@ -396,6 +415,28 @@ async fn run_vector_search(
         Err(e) => {
             tx.send(AppEvent::Error(format!("Embed error: {e}"))).ok();
             tx.send(AppEvent::VectorSearchResults(vec![])).ok();
+        }
+    }
+}
+
+async fn run_summarize(
+    transcript: String,
+    config: config::SummarizerConfig,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let client = llm::summarizer::SummarizerClient::new(&config);
+    match client.summarize_stream(&transcript).await {
+        Ok(mut stream) => {
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(token) => { tx.send(AppEvent::SummaryChunk(token)).ok(); }
+                    Err(e) => { tx.send(AppEvent::SummaryError(e.to_string())).ok(); return; }
+                }
+            }
+            tx.send(AppEvent::SummaryDone).ok();
+        }
+        Err(e) => {
+            tx.send(AppEvent::SummaryError(e.to_string())).ok();
         }
     }
 }
