@@ -65,7 +65,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
 
     let mut list_state = ListState::default();
     if !state.vsearch_results.is_empty() {
-        list_state.select(Some(0));
+        list_state.select(Some(state.vsearch_cursor));
     }
     f.render_stateful_widget(list, chunks[2], &mut list_state);
 }

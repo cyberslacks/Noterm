@@ -27,6 +27,13 @@ pub fn store_embedding(
     Ok(())
 }
 
+/// Wipe all stored embeddings so every note is re-indexed on the next save/startup.
+pub fn clear_all_embeddings(db: &Db) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM embeddings", [])?;
+    Ok(())
+}
+
 pub fn needs_embedding(db: &Db, note_id: &str, content_hash: &str, model: &str) -> bool {
     let conn = db.lock().unwrap();
     let result: Result<String, _> = conn.query_row(

@@ -4,7 +4,8 @@ use futures::StreamExt;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{AppEvent, AppState, Mode};
+use crate::app::{AppEvent, AppState, Mode, SettingsMode};
+use crate::tui::widgets::settings_panel as sp;
 
 pub enum Action {
     Continue,
@@ -40,6 +41,7 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<Action> {
         Mode::GitCommitInput => handle_git_commit_input(state, key),
         Mode::ConfirmDelete => handle_confirm_delete(state, key).await,
         Mode::MeetilyImport => handle_meetily(state, key).await,
+        Mode::Settings => handle_settings(state, key),
     }
 }
 
@@ -79,6 +81,21 @@ async fn handle_normal(state: &mut AppState, key: KeyEvent) -> Result<Action> {
             state.enter_mode(Mode::Chat);
         }
         KeyCode::Char('K') => {
+            // Load tasks from the current note's frontmatter
+            let tasks = state
+                .current_note
+                .as_ref()
+                .and_then(|n| n.frontmatter.tasks.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut t| {
+                    if let Some(note) = &state.current_note {
+                        t.note_path = note.relative_path.clone();
+                    }
+                    t
+                })
+                .collect();
+            state.kanban = crate::tasks::KanbanState::from_tasks(tasks);
             state.enter_mode(Mode::Kanban);
         }
         KeyCode::Char('G') => {
@@ -106,6 +123,23 @@ async fn handle_normal(state: &mut AppState, key: KeyEvent) -> Result<Action> {
                 if let Ok(Ok(log)) = log_result {
                     tx.send(AppEvent::GitLogResult(Ok(log))).ok();
                 }
+            });
+        }
+        KeyCode::Char('S') => {
+            state.settings_cursor = 0;
+            state.settings_mode = SettingsMode::Navigating;
+            state.settings_edit_buf.clear();
+            state.settings_model_cursor = 0;
+            state.enter_mode(Mode::Settings);
+            // Fetch available models in background
+            let ollama_url = state.config.llm.ollama_base_url.clone();
+            let openai_url = state.config.llm.openai_base_url.clone();
+            let openai_key = state.config.llm.openai_api_key.clone().unwrap_or_default();
+            let tx = state.tx.clone();
+            tokio::spawn(async move {
+                let ollama = crate::llm::list_ollama_models(&ollama_url).await.unwrap_or_default();
+                let openai = crate::llm::list_openai_models(&openai_url, &openai_key).await.unwrap_or_default();
+                tx.send(AppEvent::ModelsLoaded { ollama, openai }).ok();
             });
         }
         KeyCode::Char('I') => {
@@ -187,6 +221,18 @@ fn index_current_note(state: &AppState) {
             .await
             .ok();
         });
+
+        if state.config.search.embed_on_save {
+            let note_id = note.frontmatter.id.clone()
+                .unwrap_or_else(|| note.relative_path.clone());
+            let content = format!("{}\n\n{}", note.frontmatter.title.clone().unwrap_or_default(), note.body);
+            state.tx.send(crate::app::AppEvent::EmbedRequest {
+                note_id,
+                note_path: note.relative_path.clone(),
+                content_hash: note.content_hash.clone(),
+                content,
+            }).ok();
+        }
     }
 }
 
@@ -247,13 +293,37 @@ fn handle_vsearch(state: &mut AppState, key: KeyEvent) -> Result<Action> {
     match key.code {
         KeyCode::Esc => state.mode = Mode::Normal,
         KeyCode::Enter => {
-            if !state.vsearch_query.is_empty() && !state.vsearch_loading {
-                // Signal embedding query — handled in main loop
+            if !state.vsearch_results.is_empty() {
+                // Open selected result
+                if let Some(result) = state.vsearch_results.get(state.vsearch_cursor).cloned() {
+                    let path = state.notes_dir.join(&result.relative_path);
+                    if let Ok(note) = crate::notes::Note::from_path(&path, &state.notes_dir) {
+                        state.open_note(note);
+                        state.mode = Mode::Normal;
+                    }
+                }
+            } else if !state.vsearch_query.is_empty() && !state.vsearch_loading {
                 state.vsearch_loading = true;
             }
         }
-        KeyCode::Char(c) => state.vsearch_query.push(c),
-        KeyCode::Backspace => { state.vsearch_query.pop(); }
+        KeyCode::Up => {
+            state.vsearch_cursor = state.vsearch_cursor.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if state.vsearch_cursor + 1 < state.vsearch_results.len() {
+                state.vsearch_cursor += 1;
+            }
+        }
+        KeyCode::Char(c) => {
+            state.vsearch_query.push(c);
+            state.vsearch_results.clear();
+            state.vsearch_cursor = 0;
+        }
+        KeyCode::Backspace => {
+            state.vsearch_query.pop();
+            state.vsearch_results.clear();
+            state.vsearch_cursor = 0;
+        }
         _ => {}
     }
     Ok(Action::Continue)
@@ -283,7 +353,10 @@ fn handle_chat(state: &mut AppState, key: KeyEvent) -> Result<Action> {
 
 fn handle_kanban(state: &mut AppState, key: KeyEvent) -> Result<Action> {
     match key.code {
-        KeyCode::Esc => state.mode = Mode::Normal,
+        KeyCode::Esc => {
+            save_kanban_to_note(state)?;
+            state.mode = Mode::Normal;
+        }
         KeyCode::Char('h') | KeyCode::Left => state.kanban.nav_col_left(),
         KeyCode::Char('l') | KeyCode::Right => state.kanban.nav_col_right(),
         KeyCode::Char('j') | KeyCode::Down => state.kanban.nav_down(),
@@ -293,6 +366,23 @@ fn handle_kanban(state: &mut AppState, key: KeyEvent) -> Result<Action> {
         _ => {}
     }
     Ok(Action::Continue)
+}
+
+fn save_kanban_to_note(state: &mut AppState) -> Result<()> {
+    if let Some(note) = &mut state.current_note {
+        let tasks: Vec<crate::tasks::Task> = state
+            .kanban
+            .columns
+            .iter()
+            .flat_map(|col| col.cards.iter().cloned())
+            .collect();
+
+        note.frontmatter.tasks = if tasks.is_empty() { None } else { Some(tasks) };
+        let body = note.body.clone();
+        note.raw = crate::notes::frontmatter::serialize(&note.frontmatter, &body);
+        std::fs::write(&note.path, &note.raw)?;
+    }
+    Ok(())
 }
 
 fn handle_git(state: &mut AppState, key: KeyEvent) -> Result<Action> {
@@ -558,6 +648,122 @@ async fn handle_confirm_delete(state: &mut AppState, key: KeyEvent) -> Result<Ac
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
             state.mode = Mode::Normal;
+        }
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+fn handle_settings(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    match &state.settings_mode.clone() {
+        SettingsMode::Navigating => handle_settings_nav(state, key),
+        SettingsMode::EditingText => handle_settings_edit(state, key),
+        SettingsMode::PickingModel => handle_settings_pick(state, key),
+    }
+}
+
+fn handle_settings_nav(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    match key.code {
+        KeyCode::Esc => {
+            state.config.write().ok();
+            state.set_status("Settings saved".into(), crate::app::StatusLevel::Success);
+            state.mode = Mode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if state.settings_cursor + 1 < sp::TOTAL_FIELDS {
+                state.settings_cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.settings_cursor = state.settings_cursor.saturating_sub(1);
+        }
+        KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+            match state.settings_cursor {
+                sp::FIELD_CHAT_PROVIDER => sp::cycle_chat_provider(state),
+                sp::FIELD_EMBED_PROVIDER => sp::cycle_embed_provider(state),
+                _ => {}
+            }
+        }
+        KeyCode::Enter => {
+            if sp::is_provider_field(state.settings_cursor) {
+                match state.settings_cursor {
+                    sp::FIELD_CHAT_PROVIDER => sp::cycle_chat_provider(state),
+                    sp::FIELD_EMBED_PROVIDER => sp::cycle_embed_provider(state),
+                    _ => {}
+                }
+            } else if sp::is_model_field(state.settings_cursor) {
+                state.settings_model_cursor = 0;
+                state.settings_mode = SettingsMode::PickingModel;
+            } else {
+                // Text edit mode: populate edit buf with current raw value
+                state.settings_edit_buf = sp::get_field_raw(state, state.settings_cursor);
+                state.settings_mode = SettingsMode::EditingText;
+            }
+        }
+        KeyCode::Char('s') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            state.config.write().ok();
+            state.set_status("Settings saved".into(), crate::app::StatusLevel::Success);
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            state.tx.send(AppEvent::ForceReembed).ok();
+        }
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+fn handle_settings_edit(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    match key.code {
+        KeyCode::Esc => {
+            state.settings_edit_buf.clear();
+            state.settings_mode = SettingsMode::Navigating;
+        }
+        KeyCode::Enter => {
+            let value = state.settings_edit_buf.drain(..).collect::<String>();
+            let field = state.settings_cursor;
+            sp::apply_field_value(state, field, value);
+            state.settings_mode = SettingsMode::Navigating;
+        }
+        KeyCode::Char(c) => {
+            state.settings_edit_buf.push(c);
+        }
+        KeyCode::Backspace => {
+            state.settings_edit_buf.pop();
+        }
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+fn handle_settings_pick(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    let model_count = if sp::uses_ollama_models(state.settings_cursor) {
+        state.available_ollama_models.len()
+    } else {
+        state.available_openai_models.len()
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            state.settings_mode = SettingsMode::Navigating;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if model_count > 0 && state.settings_model_cursor + 1 < model_count {
+                state.settings_model_cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.settings_model_cursor = state.settings_model_cursor.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            let selected = if sp::uses_ollama_models(state.settings_cursor) {
+                state.available_ollama_models.get(state.settings_model_cursor).cloned()
+            } else {
+                state.available_openai_models.get(state.settings_model_cursor).cloned()
+            };
+            if let Some(model) = selected {
+                sp::apply_field_value(state, state.settings_cursor, model);
+            }
+            state.settings_mode = SettingsMode::Navigating;
         }
         _ => {}
     }

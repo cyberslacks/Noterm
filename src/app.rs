@@ -26,6 +26,14 @@ pub enum Mode {
     GitCommitInput, // inline commit message prompt
     ConfirmDelete,  // confirmation overlay before deleting a note
     MeetilyImport,  // Meetily meeting browser overlay
+    Settings,       // LLM / provider settings panel
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingsMode {
+    Navigating,
+    EditingText,
+    PickingModel,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,12 +55,20 @@ pub enum AppEvent {
     ChatChunk(String),
     ChatDone,
     ChatError(String),
+    EmbedRequest {
+        note_id: String,
+        note_path: String,
+        content_hash: String,
+        content: String,
+    },
     EmbeddingDone(PathBuf),
     IndexingComplete,
     NoteImported(PathBuf),   // a note was auto-imported (watch folder or API)
     NoteDeleted(PathBuf),    // a note was deleted from disk
     MeetilyMeetingsLoaded(Vec<MeetilyMeeting>),
     MeetilyImportDone { path: PathBuf, meetily_id: String },
+    ModelsLoaded { ollama: Vec<String>, openai: Vec<String> },
+    ForceReembed,
     Error(String),
 }
 
@@ -99,6 +115,7 @@ pub struct AppState {
     // Vector search
     pub vsearch_query: String,
     pub vsearch_results: Vec<VectorSearchResult>,
+    pub vsearch_cursor: usize,
     pub vsearch_loading: bool,
 
     // Chat
@@ -122,6 +139,14 @@ pub struct AppState {
 
     // Meetily import panel
     pub meetily: MeetilyPanelState,
+
+    // Settings panel
+    pub settings_mode: SettingsMode,
+    pub settings_cursor: usize,
+    pub settings_edit_buf: String,
+    pub settings_model_cursor: usize,
+    pub available_ollama_models: Vec<String>,
+    pub available_openai_models: Vec<String>,
 
     // Status bar notification
     pub status_message: Option<(String, StatusLevel)>,
@@ -148,6 +173,7 @@ impl AppState {
             search_cursor: 0,
             vsearch_query: String::new(),
             vsearch_results: Vec::new(),
+            vsearch_cursor: 0,
             vsearch_loading: false,
             chat_messages: Vec::new(),
             chat_input: String::new(),
@@ -161,6 +187,12 @@ impl AppState {
             git_commit_msg: String::new(),
             prompt_input: String::new(),
             meetily: MeetilyPanelState::default(),
+            settings_mode: SettingsMode::Navigating,
+            settings_cursor: 0,
+            settings_edit_buf: String::new(),
+            settings_model_cursor: 0,
+            available_ollama_models: Vec::new(),
+            available_openai_models: Vec::new(),
             status_message: None,
             config,
             tx,
@@ -184,6 +216,7 @@ impl AppState {
 
             AppEvent::VectorSearchResults(results) => {
                 self.vsearch_results = results;
+                self.vsearch_cursor = 0;
                 self.vsearch_loading = false;
             }
 
@@ -231,6 +264,10 @@ impl AppState {
                 self.chat_loading = false;
                 self.chat_streaming_buf.clear();
                 self.set_status(format!("LLM error: {e}"), StatusLevel::Error);
+            }
+
+            AppEvent::EmbedRequest { .. } => {
+                // handled in main event loop (requires db access)
             }
 
             AppEvent::EmbeddingDone(path) => {
@@ -282,6 +319,15 @@ impl AppState {
                     .unwrap_or_default();
                     tx.send(AppEvent::FileTreeRefresh(nodes)).ok();
                 });
+            }
+
+            AppEvent::ModelsLoaded { ollama, openai } => {
+                self.available_ollama_models = ollama;
+                self.available_openai_models = openai;
+            }
+
+            AppEvent::ForceReembed => {
+                // handled in main event loop before reaching here
             }
 
             AppEvent::Error(e) => {

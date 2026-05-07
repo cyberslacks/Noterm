@@ -78,6 +78,51 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Background-embed all existing notes that are missing or stale (runs serially)
+    if app.config.search.embed_on_save {
+        let notes_dir = app.notes_dir.clone();
+        let show_hidden = app.config.ui.show_hidden;
+        let llm_config = app.config.llm.clone();
+        let db2 = db.clone();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            let notes_dir_scan = notes_dir.clone();
+            let nodes = tokio::task::spawn_blocking(move || {
+                notes::watcher::scan_dir(&notes_dir_scan, show_hidden)
+            })
+            .await
+            .unwrap_or_default();
+
+            for node in nodes.into_iter().filter(|n| !n.is_dir) {
+                let nd = notes_dir.clone();
+                let path = node.path.clone();
+                if let Ok(Ok(note)) = tokio::task::spawn_blocking(move || {
+                    notes::Note::from_path(&path, &nd)
+                })
+                .await
+                {
+                    let note_id = note.frontmatter.id.clone()
+                        .unwrap_or_else(|| note.relative_path.clone());
+                    let content = format!(
+                        "{}\n\n{}",
+                        note.frontmatter.title.clone().unwrap_or_default(),
+                        note.body
+                    );
+                    run_embed_note(
+                        note_id,
+                        note.relative_path,
+                        note.content_hash,
+                        content,
+                        llm_config.clone(),
+                        db2.clone(),
+                        tx2.clone(),
+                    )
+                    .await;
+                }
+            }
+        });
+    }
+
     // Start inbox folder watcher (runs forever in background)
     {
         let inbox_dir = app.config.import.resolved_watch_dir();
@@ -173,11 +218,70 @@ async fn main() -> Result<()> {
 
             // Events from background tasks (LLM chunks, git results, etc.)
             Some(event) = rx.recv() => {
-                // Reset chat_task_spawned when done
                 if matches!(event, AppEvent::ChatDone | AppEvent::ChatError(_)) {
                     chat_task_spawned = false;
                 }
-                app.handle_app_event(event);
+                // EmbedRequest and ForceReembed need db — handle before dispatching to AppState
+                if let AppEvent::EmbedRequest { note_id, note_path, content_hash, content } = event {
+                    let llm_config = app.config.llm.clone();
+                    let db2 = db.clone();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        run_embed_note(note_id, note_path, content_hash, content, llm_config, db2, tx2).await;
+                    });
+                } else if let AppEvent::ForceReembed = event {
+                    // Clear all embeddings then re-index every note with the current provider
+                    let db2 = db.clone();
+                    let notes_dir = app.notes_dir.clone();
+                    let show_hidden = app.config.ui.show_hidden;
+                    let llm_config = app.config.llm.clone();
+                    let tx2 = tx.clone();
+                    app.set_status("Re-embedding all notes…".into(), app::StatusLevel::Info);
+                    tokio::spawn(async move {
+                        // Clear cache
+                        if let Err(e) = tokio::task::spawn_blocking({
+                            let db3 = db2.clone();
+                            move || search::vector::clear_all_embeddings(&db3)
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))) {
+                            tx2.send(AppEvent::Error(format!("Clear embeddings: {e}"))).ok();
+                            return;
+                        }
+
+                        // Re-scan and re-embed every note
+                        let nd = notes_dir.clone();
+                        let nodes = tokio::task::spawn_blocking(move || {
+                            notes::watcher::scan_dir(&nd, show_hidden)
+                        }).await.unwrap_or_default();
+
+                        for node in nodes.into_iter().filter(|n| !n.is_dir) {
+                            let nd2 = notes_dir.clone();
+                            let path = node.path.clone();
+                            if let Ok(Ok(note)) = tokio::task::spawn_blocking(move || {
+                                notes::Note::from_path(&path, &nd2)
+                            }).await {
+                                let note_id = note.frontmatter.id.clone()
+                                    .unwrap_or_else(|| note.relative_path.clone());
+                                let content = format!(
+                                    "{}\n\n{}",
+                                    note.frontmatter.title.clone().unwrap_or_default(),
+                                    note.body
+                                );
+                                run_embed_note(
+                                    note_id,
+                                    note.relative_path,
+                                    note.content_hash,
+                                    content,
+                                    llm_config.clone(),
+                                    db2.clone(),
+                                    tx2.clone(),
+                                ).await;
+                            }
+                        }
+                        tx2.send(AppEvent::IndexingComplete).ok();
+                    });
+                } else {
+                    app.handle_app_event(event);
+                }
             }
 
             // Periodic tick
@@ -204,6 +308,52 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_embed_note(
+    note_id: String,
+    note_path: String,
+    content_hash: String,
+    content: String,
+    llm_config: config::LlmConfig,
+    db: db::Db,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let model = llm::embed_model_name(&llm_config);
+
+    // Skip if embedding is already current
+    let skip = tokio::task::spawn_blocking({
+        let db2 = db.clone();
+        let id = note_id.clone();
+        let hash = content_hash.clone();
+        let m = model.clone();
+        move || !search::vector::needs_embedding(&db2, &id, &hash, &m)
+    })
+    .await
+    .unwrap_or(false);
+
+    if skip {
+        return;
+    }
+
+    let client = llm::make_embed_client(&llm_config);
+    match client.embed(&content).await {
+        Ok(embedding) => {
+            let note_path_for_event = note_path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                search::vector::store_embedding(&db, &note_id, &note_path, &content_hash, &embedding, &model)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => { tx.send(AppEvent::EmbeddingDone(note_path_for_event.into())).ok(); }
+                Ok(Err(e)) => { tx.send(AppEvent::Error(format!("Embed store: {e}"))).ok(); }
+                Err(e) => { tx.send(AppEvent::Error(format!("Embed task: {e}"))).ok(); }
+            }
+        }
+        Err(e) => {
+            tx.send(AppEvent::Error(format!("Embed: {e}"))).ok();
+        }
+    }
+}
+
 async fn run_fts_search(
     query: String,
     index_dir: std::path::PathBuf,
@@ -228,10 +378,10 @@ async fn run_vector_search(
     db: db::Db,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
-    let client = llm::make_client(&llm_config);
+    let client = llm::make_embed_client(&llm_config);
     match client.embed(&query).await {
         Ok(embedding) => {
-            let model = llm_config.ollama_embed_model.clone();
+            let model = llm::embed_model_name(&llm_config);
             let result = tokio::task::spawn_blocking(move || {
                 search::vector::top_k_similar(&db, &embedding, &model, 10)
             })

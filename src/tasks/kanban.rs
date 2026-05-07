@@ -1,10 +1,16 @@
 use super::{Task, TaskStatus};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct KanbanState {
     pub columns: Vec<KanbanColumn>,
     pub focused_col: usize,
     pub focused_card: usize,
+}
+
+impl Default for KanbanState {
+    fn default() -> Self {
+        Self::from_tasks(vec![])
+    }
 }
 
 #[derive(Debug, Clone)]

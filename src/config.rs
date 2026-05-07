@@ -85,24 +85,55 @@ pub enum LlmProvider {
     OpenAI,
 }
 
+/// Which backend to use for generating embeddings (vector search).
+/// Claude does not support embeddings, so this is separate from the chat provider.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbedProvider {
+    /// Use Ollama (default). Points at `ollama_base_url`.
+    Ollama,
+    /// Use any OpenAI-compatible API — includes OpenWebUI, LocalAI, etc.
+    /// Points at `openai_base_url` with `openai_api_key`.
+    OpenAI,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
+    /// Provider used for chat completions.
     #[serde(default)]
     pub provider: LlmProvider,
+
+    // --- Ollama ---
     #[serde(default = "default_ollama_url")]
     pub ollama_base_url: String,
     #[serde(default = "default_chat_model")]
     pub ollama_chat_model: String,
     #[serde(default = "default_embed_model")]
     pub ollama_embed_model: String,
+
+    // --- Claude ---
     pub claude_api_key: Option<String>,
     #[serde(default = "default_claude_model")]
     pub claude_model: String,
+
+    // --- OpenAI-compatible (also used for OpenWebUI) ---
     pub openai_api_key: Option<String>,
+    /// Base URL for the OpenAI-compatible API. Set to your OpenWebUI URL, e.g.
+    /// "http://localhost:3000/api" to use OpenWebUI instead of OpenAI.
     #[serde(default = "default_openai_url")]
     pub openai_base_url: String,
+    /// Model used for chat when provider = "openai".
     #[serde(default = "default_openai_model")]
     pub openai_model: String,
+    /// Model used for embeddings when embed_provider = "openai".
+    #[serde(default = "default_openai_embed_model")]
+    pub openai_embed_model: String,
+
+    // --- Embedding ---
+    /// Which provider to use for embeddings (independent of chat provider).
+    #[serde(default)]
+    pub embed_provider: EmbedProvider,
+
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
     #[serde(default = "default_context_notes")]
@@ -153,6 +184,7 @@ fn default_embed_model() -> String { "nomic-embed-text".into() }
 fn default_claude_model() -> String { "claude-sonnet-4-5".into() }
 fn default_openai_url() -> String { "https://api.openai.com/v1".into() }
 fn default_openai_model() -> String { "gpt-4o".into() }
+fn default_openai_embed_model() -> String { "text-embedding-3-small".into() }
 fn default_context_notes() -> usize { 5 }
 fn default_tree_width() -> u16 { 20 }
 fn default_chat_width() -> u16 { 35 }
@@ -166,6 +198,29 @@ fn default_system_prompt() -> String {
 
 impl Default for LlmProvider {
     fn default() -> Self { LlmProvider::Ollama }
+}
+
+impl Default for EmbedProvider {
+    fn default() -> Self { EmbedProvider::Ollama }
+}
+
+impl std::fmt::Display for LlmProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LlmProvider::Ollama => write!(f, "Ollama"),
+            LlmProvider::Claude => write!(f, "Claude"),
+            LlmProvider::OpenAI => write!(f, "OpenAI / WebUI"),
+        }
+    }
+}
+
+impl std::fmt::Display for EmbedProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmbedProvider::Ollama => write!(f, "Ollama"),
+            EmbedProvider::OpenAI => write!(f, "OpenAI / WebUI"),
+        }
+    }
 }
 
 impl Default for EditorConfig {
@@ -202,6 +257,8 @@ impl Default for LlmConfig {
             openai_api_key: None,
             openai_base_url: default_openai_url(),
             openai_model: default_openai_model(),
+            openai_embed_model: default_openai_embed_model(),
+            embed_provider: EmbedProvider::Ollama,
             system_prompt: default_system_prompt(),
             max_context_notes: default_context_notes(),
         }

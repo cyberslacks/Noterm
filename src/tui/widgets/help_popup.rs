@@ -60,6 +60,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, _state: &AppState) {
         ("Tab", "Switch Status / Log tabs"),
         ("", ""),
         ("I", "Meetily import panel"),
+        ("S", "Settings (LLM provider, models, API keys)"),
         ("q / Ctrl+q", "Quit noterm"),
     ];
 

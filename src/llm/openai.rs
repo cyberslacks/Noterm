@@ -9,6 +9,7 @@ use crate::config::LlmConfig;
 pub struct OpenAiClient {
     api_key: String,
     model: String,
+    embed_model: String,
     base_url: String,
     http: reqwest::Client,
 }
@@ -18,6 +19,7 @@ impl OpenAiClient {
         Self {
             api_key: config.openai_api_key.clone().unwrap_or_default(),
             model: config.openai_model.clone(),
+            embed_model: config.openai_embed_model.clone(),
             base_url: config.openai_base_url.clone(),
             http: reqwest::Client::new(),
         }
@@ -48,13 +50,16 @@ impl LlmClient for OpenAiClient {
             "stream": true
         });
 
-        let response = self
+        let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+
+        let response = req.send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -88,29 +93,57 @@ impl LlmClient for OpenAiClient {
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let body = json!({
-            "model": "text-embedding-3-small",
+            "model": self.embed_model,
             "input": text
         });
 
-        let response = self
+        let mut req = self
             .http
             .post(format!("{}/embeddings", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+
+        // Only attach the auth header when a key is actually configured —
+        // sending "Bearer " (empty token) causes 401s on local OpenWebUI.
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(&self.api_key);
+        }
+
+        let response = req.send().await?;
 
         if !response.status().is_success() {
-            bail!("OpenAI embed error: {}", response.status());
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "Embed API error {status} from {}/embeddings (model: {}): {body}",
+                self.base_url,
+                self.embed_model
+            );
         }
 
         let data: serde_json::Value = response.json().await?;
+
         let embedding: Vec<f32> = data["data"][0]["embedding"]
             .as_array()
-            .unwrap_or(&vec![])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unexpected embed response from {}/embeddings (model: {}). \
+                     Expected {{\"data\":[{{\"embedding\":[...]}}]}}. Got: {}",
+                    self.base_url,
+                    self.embed_model,
+                    data
+                )
+            })?
             .iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect();
+
+        if embedding.is_empty() {
+            bail!(
+                "Embed model '{}' at {} returned a zero-length vector",
+                self.embed_model,
+                self.base_url
+            );
+        }
 
         Ok(embedding)
     }
