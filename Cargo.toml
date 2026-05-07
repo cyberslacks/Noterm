@@ -20,11 +20,11 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
 
-# HTTP — reqwest 0.12 uses rustls by default (no openssl-dev required)
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# HTTP — rustls-tls avoids any OpenSSL system dependency (required for musl/windows cross-compilation)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
-# Git — vendored compiles libgit2 from source so the binary has no system libgit2 dep
-git2 = { version = "0.19", features = ["vendored-libgit2"] }
+# Git — vendored compiles libgit2+openssl from source so cross-compilation works without system OpenSSL
+git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 
 # Full-text search
 tantivy = "0.22"
