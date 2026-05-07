@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 use tantivy::{
     collector::TopDocs,
-    query::QueryParser,
+    query::{BooleanQuery, Occur, Query, QueryParser, RegexQuery},
     schema::{Field, OwnedValue, Schema, STORED, STRING, TEXT},
     Index, IndexReader, IndexWriter, ReloadPolicy,
 };
@@ -93,14 +93,8 @@ impl FtsIndex {
             vec![self.f_title, self.f_body, self.f_tags],
         );
 
-        let query = query_parser
-            .parse_query(query_str)
-            .unwrap_or_else(|_| {
-                // Fallback: treat as literal phrase
-                query_parser
-                    .parse_query(&format!("\"{}\"", query_str.replace('"', "")))
-                    .unwrap_or_else(|_| Box::new(tantivy::query::AllQuery))
-            });
+        let search_fields = [self.f_title, self.f_body, self.f_tags];
+        let query = build_search_query(query_str, &search_fields, &query_parser);
 
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
 
@@ -128,4 +122,82 @@ impl FtsIndex {
 
         Ok(results)
     }
+}
+
+/// Build a search query that supports partial-word (prefix) matching.
+///
+/// For plain words, each token is matched against the term dictionary using a
+/// regex prefix query (`kuber.*`), which works because Tantivy stores individual
+/// lowercased tokens and RegexQuery iterates them directly — bypassing the
+/// tokenizer that would strip `*` in QueryParser wildcard syntax.
+///
+/// When the user uses explicit operators (`"phrase"`, `AND`, `OR`, field:), we
+/// hand off to QueryParser unchanged.
+fn build_search_query(
+    query_str: &str,
+    fields: &[Field],
+    parser: &QueryParser,
+) -> Box<dyn Query> {
+    let has_operators = query_str.contains('"')
+        || query_str.contains(':')
+        || query_str.to_ascii_uppercase().contains(" AND ")
+        || query_str.to_ascii_uppercase().contains(" OR ");
+
+    if has_operators {
+        return parser
+            .parse_query(query_str)
+            .unwrap_or_else(|_| Box::new(tantivy::query::AllQuery));
+    }
+
+    let words: Vec<String> = query_str
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect();
+
+    if words.is_empty() {
+        return Box::new(tantivy::query::AllQuery);
+    }
+
+    // Each word must match (AND); across fields it's OR (any field may contain it).
+    let word_queries: Vec<(Occur, Box<dyn Query>)> = words
+        .iter()
+        .map(|word| {
+            let pattern = format!("{}.*", regex_escape(word));
+            let field_queries: Vec<(Occur, Box<dyn Query>)> = fields
+                .iter()
+                .filter_map(|&f| {
+                    RegexQuery::from_pattern(&pattern, f)
+                        .ok()
+                        .map(|q| (Occur::Should, Box::new(q) as Box<dyn Query>))
+                })
+                .collect();
+
+            let word_q: Box<dyn Query> = if field_queries.is_empty() {
+                parser
+                    .parse_query(word)
+                    .unwrap_or_else(|_| Box::new(tantivy::query::AllQuery))
+            } else {
+                Box::new(BooleanQuery::new(field_queries))
+            };
+
+            (Occur::Must, word_q)
+        })
+        .collect();
+
+    if word_queries.len() == 1 {
+        word_queries.into_iter().next().unwrap().1
+    } else {
+        Box::new(BooleanQuery::new(word_queries))
+    }
+}
+
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if matches!(c, '.' | '+' | '*' | '?' | '^' | '$' | '{' | '}' | '[' | ']' | '|' | '(' | ')' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }

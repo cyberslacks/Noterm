@@ -53,6 +53,31 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Background index all existing notes on startup
+    {
+        let notes_dir = app.notes_dir.clone();
+        let index_dir = app.config.index_dir();
+        let show_hidden = app.config.ui.show_hidden;
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let idx = crate::search::fulltext::FtsIndex::open_or_create(&index_dir)?;
+                let nodes = notes::watcher::scan_dir(&notes_dir, show_hidden);
+                for node in nodes.iter().filter(|n| !n.is_dir) {
+                    if let Ok(note) = notes::Note::from_path(&node.path, &notes_dir) {
+                        let title = note.frontmatter.title.clone().unwrap_or_default();
+                        let tags = note.frontmatter.tags.clone().unwrap_or_default();
+                        idx.index_note(&note.relative_path, &title, &note.body, &tags).ok();
+                    }
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .ok();
+            tx2.send(AppEvent::IndexingComplete).ok();
+        });
+    }
+
     // Start inbox folder watcher (runs forever in background)
     {
         let inbox_dir = app.config.import.resolved_watch_dir();
@@ -159,7 +184,7 @@ async fn main() -> Result<()> {
             _ = tick.tick() => {
                 // Fire debounced search
                 if let Some(t) = search_debounce {
-                    if t.elapsed() >= Duration::from_millis(150) {
+                    if t.elapsed() >= Duration::from_millis(300) {
                         search_debounce = None;
                         let query = app.search_query.clone();
                         if !query.is_empty() {

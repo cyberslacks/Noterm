@@ -155,19 +155,39 @@ fn handle_edit(state: &mut AppState, key: KeyEvent) -> Result<Action> {
         KeyCode::Esc => {
             if state.config.editor.auto_save {
                 state.save_current_note()?;
+                index_current_note(state);
             }
             state.mode = Mode::Normal;
         }
         _ => {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
                 state.save_current_note()?;
+                index_current_note(state);
             } else {
-                // Forward all other keys to the textarea
                 state.is_modified = state.editor.input(crossterm::event::Event::Key(key));
             }
         }
     }
     Ok(Action::Continue)
+}
+
+fn index_current_note(state: &AppState) {
+    if let Some(note) = &state.current_note {
+        let rel_path = note.relative_path.clone();
+        let title = note.frontmatter.title.clone().unwrap_or_default();
+        let body = note.body.clone();
+        let tags = note.frontmatter.tags.clone().unwrap_or_default();
+        let index_dir = state.config.index_dir();
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                if let Ok(idx) = crate::search::fulltext::FtsIndex::open_or_create(&index_dir) {
+                    idx.index_note(&rel_path, &title, &body, &tags).ok();
+                }
+            })
+            .await
+            .ok();
+        });
+    }
 }
 
 fn handle_search(state: &mut AppState, key: KeyEvent) -> Result<Action> {
@@ -176,13 +196,30 @@ fn handle_search(state: &mut AppState, key: KeyEvent) -> Result<Action> {
             state.mode = Mode::Normal;
         }
         KeyCode::Enter => {
-            // Open selected result
             if let Some(result) = state.search_results.get(state.search_cursor).cloned() {
+                // Open the selected result
                 let path = state.notes_dir.join(&result.relative_path);
                 if let Ok(note) = crate::notes::Note::from_path(&path, &state.notes_dir) {
                     state.open_note(note);
                     state.mode = Mode::Normal;
                 }
+            } else if !state.search_query.is_empty() {
+                // No results yet — fire the search immediately (bypass debounce)
+                let query = state.search_query.clone();
+                let index_dir = state.config.index_dir();
+                let tx = state.tx.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let idx = crate::search::fulltext::FtsIndex::open_or_create(&index_dir)?;
+                        idx.search(&query, 20)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(results)) => { tx.send(AppEvent::SearchResults(results)).ok(); }
+                        Ok(Err(e)) => { tx.send(AppEvent::Error(format!("Search error: {e}"))).ok(); }
+                        Err(e) => { tx.send(AppEvent::Error(format!("Search task: {e}"))).ok(); }
+                    }
+                });
             }
         }
         KeyCode::Up => {
@@ -347,7 +384,20 @@ fn handle_new_note(state: &mut AppState, key: KeyEvent) -> Result<Action> {
                 } else {
                     format!("{name}.md")
                 };
-                let path = state.notes_dir.join(&filename);
+                // Create in the selected folder, or the parent of the selected file
+                let target_dir = state
+                    .selected_file_node()
+                    .map(|n| {
+                        if n.is_dir {
+                            n.path.clone()
+                        } else {
+                            n.path.parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| state.notes_dir.clone())
+                        }
+                    })
+                    .unwrap_or_else(|| state.notes_dir.clone());
+                let path = target_dir.join(&filename);
                 if !path.exists() {
                     let id = uuid::Uuid::new_v4().to_string();
                     let now = chrono::Utc::now().to_rfc3339();
