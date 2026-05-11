@@ -6,17 +6,29 @@ use ratatui::{
     Frame,
 };
 
-use crate::{app::AppState, notes::FileNode};
+use crate::{
+    app::{AppState, TreeGroupBy, TreeItem},
+    notes::FileNode,
+};
 
 pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
     let items: Vec<ListItem> = state
-        .file_tree
+        .tree_display
         .iter()
-        .map(|node| make_item(node))
+        .map(|item| match item {
+            TreeItem::Header { label, depth } => make_header(label, *depth),
+            TreeItem::Node(idx) => make_item(&state.file_tree[*idx]),
+        })
         .collect();
 
+    let group_suffix = match state.tree_group_by {
+        TreeGroupBy::None => "",
+        TreeGroupBy::ModifiedDate => " [modified]",
+        TreeGroupBy::CreatedDate => " [created]",
+    };
+
     let block = Block::default()
-        .title(" Notes ")
+        .title(format!(" Notes{group_suffix} "))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -34,6 +46,17 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
     list_state.select(Some(state.selected_file_idx));
 
     f.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn make_header(label: &str, depth: usize) -> ListItem<'static> {
+    let indent = "  ".repeat(depth);
+    let line = Line::from(Span::styled(
+        format!("{indent}  ── {label} "),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ));
+    ListItem::new(line)
 }
 
 fn make_item(node: &FileNode) -> ListItem<'static> {

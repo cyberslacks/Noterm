@@ -50,6 +50,7 @@ async fn handle_normal(state: &mut AppState, key: KeyEvent) -> Result<Action> {
     match key.code {
         KeyCode::Char('q') => return Ok(Action::Quit),
         KeyCode::Char('?') => state.enter_mode(Mode::Help),
+        KeyCode::Tab => state.cycle_tree_group_by(),
         KeyCode::Char('j') | KeyCode::Down => state.nav_tree_down(),
         KeyCode::Char('k') | KeyCode::Up => state.nav_tree_up(),
         KeyCode::Enter => open_selected(state)?,

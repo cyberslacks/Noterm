@@ -8,6 +8,8 @@ pub struct FileNode {
     pub is_dir: bool,
     pub depth: usize,
     pub expanded: bool,
+    pub modified_secs: u64,
+    pub created_secs: u64,
 }
 
 impl FileNode {
@@ -64,6 +66,8 @@ fn collect_entries(
             is_dir: true,
             depth,
             expanded: true,
+            modified_secs: 0,
+            created_secs: 0,
         });
         collect_entries(root, &dir_path, depth + 1, show_hidden, nodes);
     }
@@ -71,6 +75,17 @@ fn collect_entries(
     for file_path in files {
         let name = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let relative = file_path.strip_prefix(root).unwrap_or(&file_path).to_string_lossy().to_string();
+        let meta = std::fs::metadata(&file_path).ok();
+        let modified_secs = meta.as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let created_secs = meta.as_ref()
+            .and_then(|m| m.created().ok())
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         nodes.push(FileNode {
             path: file_path,
             relative_path: relative,
@@ -78,6 +93,8 @@ fn collect_entries(
             is_dir: false,
             depth,
             expanded: false,
+            modified_secs,
+            created_secs,
         });
     }
 }

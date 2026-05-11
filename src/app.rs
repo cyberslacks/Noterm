@@ -19,6 +19,123 @@ use crate::{
     tasks::KanbanState,
 };
 
+// ── File-tree grouping ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TreeGroupBy {
+    None,
+    ModifiedDate,
+    CreatedDate,
+}
+
+#[derive(Debug, Clone)]
+pub enum TreeItem {
+    Header { label: String, depth: usize },
+    Node(usize), // index into file_tree
+}
+
+/// Rebuild the flat display list from raw file_tree nodes, optionally inserting
+/// date group headers between runs of files within each directory.
+pub fn build_tree_display(file_tree: &[FileNode], group_by: &TreeGroupBy) -> Vec<TreeItem> {
+    if *group_by == TreeGroupBy::None {
+        return (0..file_tree.len()).map(TreeItem::Node).collect();
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < file_tree.len() {
+        if file_tree[i].is_dir {
+            result.push(TreeItem::Node(i));
+            i += 1;
+        } else {
+            // Collect a contiguous run of files at the same depth (same parent dir)
+            let depth = file_tree[i].depth;
+            let run_start = i;
+            while i < file_tree.len() && !file_tree[i].is_dir && file_tree[i].depth == depth {
+                i += 1;
+            }
+
+            // Sort run by chosen timestamp desc (newest first)
+            let mut run: Vec<usize> = (run_start..i).collect();
+            run.sort_by(|&a, &b| {
+                let ts = |idx: usize| -> u64 {
+                    match group_by {
+                        TreeGroupBy::ModifiedDate => file_tree[idx].modified_secs,
+                        TreeGroupBy::CreatedDate => {
+                            let c = file_tree[idx].created_secs;
+                            if c == 0 { file_tree[idx].modified_secs } else { c }
+                        }
+                        TreeGroupBy::None => 0,
+                    }
+                };
+                ts(b).cmp(&ts(a))
+            });
+
+            // Emit items with a header whenever the date bucket changes
+            let mut cur_label: Option<String> = None;
+            for idx in run {
+                let ts = match group_by {
+                    TreeGroupBy::ModifiedDate => file_tree[idx].modified_secs,
+                    TreeGroupBy::CreatedDate => {
+                        let c = file_tree[idx].created_secs;
+                        if c == 0 { file_tree[idx].modified_secs } else { c }
+                    }
+                    TreeGroupBy::None => 0,
+                };
+                let label = date_group_label(ts, now_secs);
+                if cur_label.as_deref() != Some(&label) {
+                    result.push(TreeItem::Header { label: label.clone(), depth });
+                    cur_label = Some(label);
+                }
+                result.push(TreeItem::Node(idx));
+            }
+        }
+    }
+
+    result
+}
+
+fn date_group_label(file_secs: u64, now_secs: u64) -> String {
+    let days_ago = now_secs.saturating_sub(file_secs) / 86400;
+    match days_ago {
+        0 => "Today".to_string(),
+        1 => "Yesterday".to_string(),
+        2..=6 => "This Week".to_string(),
+        7..=29 => "This Month".to_string(),
+        _ => {
+            let (year, month, _) = unix_to_ymd(file_secs);
+            const MONTHS: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            format!("{} {}", MONTHS[(month.saturating_sub(1)) as usize], year)
+        }
+    }
+}
+
+fn unix_to_ymd(unix_secs: u64) -> (i32, u32, u32) {
+    let jdn = 2_440_588i64 + (unix_secs / 86400) as i64;
+    let l = jdn + 68_569;
+    let n = 4 * l / 146_097;
+    let l = l - (146_097 * n + 3) / 4;
+    let i = 4_000 * (l + 1) / 1_461_001;
+    let l = l - 1_461 * i / 4 + 31;
+    let j = 80 * l / 2_447;
+    let day = (l - 2_447 * j / 80) as u32;
+    let l = j / 11;
+    let month = (j + 2 - 12 * l) as u32;
+    let year = (100 * (n - 49) + i + l) as i32;
+    (year, month, day)
+}
+
+// ── App mode ─────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Normal,
@@ -181,6 +298,8 @@ pub struct AppState {
     // File tree
     pub notes_dir: PathBuf,
     pub file_tree: Vec<FileNode>,
+    pub tree_display: Vec<TreeItem>, // computed view; selected_file_idx indexes this
+    pub tree_group_by: TreeGroupBy,
     pub selected_file_idx: usize,
 
     // Editor/Viewer
@@ -275,6 +394,8 @@ impl AppState {
             previous_mode: Mode::Normal,
             notes_dir,
             file_tree: Vec::new(),
+            tree_display: Vec::new(),
+            tree_group_by: TreeGroupBy::None,
             selected_file_idx: 0,
             current_note: None,
             editor: TextArea::default(),
@@ -329,9 +450,18 @@ impl AppState {
         match event {
             AppEvent::FileTreeRefresh(nodes) => {
                 self.file_tree = nodes;
-                // Clamp selection
-                if self.selected_file_idx >= self.file_tree.len() {
-                    self.selected_file_idx = self.file_tree.len().saturating_sub(1);
+                self.tree_display = build_tree_display(&self.file_tree, &self.tree_group_by);
+                if self.selected_file_idx >= self.tree_display.len() {
+                    self.selected_file_idx = self.tree_display.len().saturating_sub(1);
+                }
+                // Ensure cursor lands on a Node, not a Header
+                while self.selected_file_idx > 0
+                    && matches!(
+                        self.tree_display.get(self.selected_file_idx),
+                        Some(TreeItem::Header { .. })
+                    )
+                {
+                    self.selected_file_idx -= 1;
                 }
             }
 
@@ -623,7 +753,10 @@ impl AppState {
     }
 
     pub fn selected_file_node(&self) -> Option<&FileNode> {
-        self.file_tree.get(self.selected_file_idx)
+        match self.tree_display.get(self.selected_file_idx)? {
+            TreeItem::Node(idx) => self.file_tree.get(*idx),
+            TreeItem::Header { .. } => None,
+        }
     }
 
     pub fn git_branch(&self) -> String {
@@ -656,13 +789,47 @@ impl AppState {
     }
 
     pub fn nav_tree_down(&mut self) {
-        if self.selected_file_idx + 1 < self.file_tree.len() {
-            self.selected_file_idx += 1;
+        let mut next = self.selected_file_idx + 1;
+        while next < self.tree_display.len() {
+            if matches!(self.tree_display[next], TreeItem::Node(_)) {
+                self.selected_file_idx = next;
+                return;
+            }
+            next += 1;
         }
     }
 
     pub fn nav_tree_up(&mut self) {
-        self.selected_file_idx = self.selected_file_idx.saturating_sub(1);
+        if self.selected_file_idx == 0 {
+            return;
+        }
+        let mut prev = self.selected_file_idx - 1;
+        loop {
+            if matches!(self.tree_display[prev], TreeItem::Node(_)) {
+                self.selected_file_idx = prev;
+                return;
+            }
+            if prev == 0 {
+                return;
+            }
+            prev -= 1;
+        }
+    }
+
+    pub fn cycle_tree_group_by(&mut self) {
+        self.tree_group_by = match self.tree_group_by {
+            TreeGroupBy::None => TreeGroupBy::ModifiedDate,
+            TreeGroupBy::ModifiedDate => TreeGroupBy::CreatedDate,
+            TreeGroupBy::CreatedDate => TreeGroupBy::None,
+        };
+        self.tree_display = build_tree_display(&self.file_tree, &self.tree_group_by);
+        // Reset cursor to first Node, skipping any leading Header
+        self.selected_file_idx = 0;
+        while self.selected_file_idx < self.tree_display.len()
+            && matches!(self.tree_display[self.selected_file_idx], TreeItem::Header { .. })
+        {
+            self.selected_file_idx += 1;
+        }
     }
 
     pub fn enter_mode(&mut self, mode: Mode) {

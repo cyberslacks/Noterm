@@ -26,6 +26,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         ("j / ↓", "Move down in file tree"),
         ("k / ↑", "Move up in file tree"),
         ("Enter", "Open selected file"),
+        ("Tab", "Cycle file grouping: None → Modified → Created"),
         ("PageUp / PageDn", "Scroll note viewer"),
         ("", ""),
         ("Normal Mode", ""),
