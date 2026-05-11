@@ -3,9 +3,9 @@ use ratatui::Frame;
 use super::{
     layout,
     widgets::{
-        chat_panel, confirm_delete, editor, file_tree, git_panel, help_popup, kanban,
-        meetily_panel, search_overlay, settings_panel, status_bar, summary_panel, vector_search,
-        viewer,
+        annotation_panel, chat_panel, confirm_delete, editor, file_tree, freshness_panel,
+        git_panel, help_popup, kanban, kazam_kb_panel, meetily_panel, search_overlay,
+        settings_panel, status_bar, summary_panel, vector_search, viewer,
     },
 };
 use crate::app::{AppState, Mode};
@@ -53,6 +53,9 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
         Mode::MeetilyImport => meetily_panel::render(f, area, state),
         Mode::Settings => settings_panel::render(f, area, state),
         Mode::Summarize => summary_panel::render(f, area, state),
+        Mode::FreshnessView => freshness_panel::render(f, area, state),
+        Mode::AnnotationPanel => annotation_panel::render(f, area, state),
+        Mode::KazamKbBrowser => kazam_kb_panel::render(f, area, state),
         _ => {}
     }
 }

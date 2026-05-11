@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{AppState, Mode, StatusLevel};
+use crate::notes::freshness::{self, FreshnessStatus};
 
 pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
     // Mode indicator
@@ -25,9 +26,41 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::MeetilyImport => ("MEETILY", Color::Cyan),
         Mode::Settings => ("SETTINGS", Color::Cyan),
         Mode::Summarize => ("SUMMARIZE", Color::LightMagenta),
+        Mode::FreshnessView => ("FRESHNESS", Color::Yellow),
+        Mode::AnnotationPanel => ("ANNOTATE", Color::Yellow),
+        Mode::KazamKbBrowser => ("KAZAM KB", Color::Cyan),
     };
 
-    let left = Line::from(vec![
+    // Compute freshness badge for the open note (if it has review_every)
+    let freshness_span = state.current_note.as_ref().and_then(|note| {
+        let fm = &note.frontmatter;
+        let info = freshness::compute(
+            fm.modified.as_deref(),
+            fm.review_every.as_deref(),
+            fm.expires.as_deref(),
+        )?;
+        let (label, color) = match info.status() {
+            FreshnessStatus::Expired { days_past_expiry } => {
+                (format!(" EXPIRED {days_past_expiry}d "), Color::Red)
+            }
+            FreshnessStatus::Overdue { days_overdue } => {
+                (format!(" OVERDUE {days_overdue}d "), Color::Red)
+            }
+            FreshnessStatus::DueSoon { days_until_due } => {
+                (format!(" DUE IN {days_until_due}d "), Color::Yellow)
+            }
+            FreshnessStatus::Fresh => (" FRESH ".to_string(), Color::Green),
+        };
+        Some(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ))
+    });
+
+    let mut left_spans = vec![
         Span::styled(
             format!(" {mode_str} "),
             Style::default()
@@ -44,7 +77,25 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
                 .unwrap_or_else(|| state.notes_dir.to_string_lossy().to_string()),
             Style::default().fg(Color::White),
         ),
-    ]);
+    ];
+    if let Some(badge) = freshness_span {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(badge);
+    }
+
+    // Annotation pending count badge
+    if state.annotation_pending_count > 0 && state.current_note.is_some() {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!(" A:{} ", state.annotation_pending_count),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let left = Line::from(left_spans);
 
     let right_text = if let Some((msg, level)) = &state.status_message {
         let color = match level {
@@ -54,6 +105,13 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
             StatusLevel::Error => Color::Red,
         };
         Line::from(Span::styled(format!("{msg} "), Style::default().fg(color)))
+    } else if let Some(version) = &state.update_available {
+        Line::from(vec![
+            Span::styled(
+                format!(" \u{2b06} {version} available "),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        ])
     } else {
         let branch = state.git_branch();
         Line::from(Span::styled(
@@ -64,7 +122,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(30)])
+        .constraints([Constraint::Min(0), Constraint::Length(35)])
         .split(area);
 
     f.render_widget(Paragraph::new(left).style(Style::default().bg(Color::Black)), chunks[0]);

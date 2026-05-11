@@ -2,8 +2,10 @@ mod app;
 mod config;
 mod db;
 mod error;
+mod export;
 mod git;
 mod import;
+mod kazam;
 mod llm;
 mod notes;
 mod search;
@@ -22,6 +24,13 @@ use config::Config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle --version / -V before TUI starts (safe to write to stdout here)
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("noterm {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Load config first (creates default if missing)
     let config = Config::load()?;
 
@@ -135,6 +144,14 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Check for a newer release in the background
+    {
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            check_for_update(tx2).await;
+        });
+    }
+
     // Start local REST API if enabled in config
     if app.config.import.api_enabled {
         let api_state = import::api::ApiState {
@@ -195,9 +212,14 @@ async fn main() -> Result<()> {
                             let messages = app.chat_messages.clone();
                             let config = app.config.llm.clone();
                             let current_note = app.current_note.clone();
+                            let kazam_pages = if app.chat_kazam_context {
+                                app.kazam_kb_pages.clone()
+                            } else {
+                                Vec::new()
+                            };
                             let tx2 = tx.clone();
                             tokio::spawn(async move {
-                                send_chat(messages, config, current_note, tx2).await;
+                                send_chat(messages, config, current_note, kazam_pages, tx2).await;
                             });
                         }
                     }
@@ -441,14 +463,49 @@ async fn run_summarize(
     }
 }
 
+async fn check_for_update(tx: mpsc::UnboundedSender<AppEvent>) {
+    const CURRENT: &str = env!("CARGO_PKG_VERSION");
+    const API_URL: &str = "https://api.github.com/repos/cyberslacks/Noterm/releases/latest";
+
+    let client = match reqwest::Client::builder()
+        .user_agent(format!("noterm/{CURRENT}"))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let resp = match client.get(API_URL).send().await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let tag = match json.get("tag_name").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => return,
+    };
+
+    // Strip leading 'v' for comparison
+    let latest = tag.trim_start_matches('v');
+    if latest != CURRENT {
+        tx.send(AppEvent::UpdateAvailable(tag)).ok();
+    }
+}
+
 async fn send_chat(
     messages: Vec<llm::ChatMessage>,
     llm_config: config::LlmConfig,
     current_note: Option<notes::Note>,
+    kazam_pages: Vec<String>,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) {
     let context_notes: Vec<notes::Note> = current_note.into_iter().collect();
-    let system = llm::context::build_system_prompt(&llm_config, &context_notes);
+    let system = llm::context::build_system_prompt(&llm_config, &context_notes, &kazam_pages);
     let client = llm::make_client(&llm_config);
 
     match client.chat_stream(messages, &system).await {

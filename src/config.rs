@@ -22,6 +22,30 @@ pub struct Config {
     pub meetily: MeetilyConfig,
     #[serde(default)]
     pub summarizer: SummarizerConfig,
+    #[serde(default)]
+    pub freshness: FreshnessConfig,
+    #[serde(default)]
+    pub kazam: KazamConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KazamConfig {
+    /// Path to Kazam KB directory (leave empty or unset to disable KB browser).
+    pub kb_path: Option<String>,
+    /// Subfolder within notes_dir for imported Kazam pages. Default: "kazam"
+    #[serde(default = "default_kazam_import_folder")]
+    pub import_folder: String,
+    /// Path to the kazam binary for MCP subprocess. Default: "kazam"
+    #[serde(default = "default_kazam_binary")]
+    pub binary_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshnessConfig {
+    /// Default owner set on new notes when using `review_every`. Leave blank to omit.
+    pub default_owner: Option<String>,
+    /// Default cadence for new notes. Accepts Nd/Nw/Nm/Ny or weekly/monthly/quarterly/yearly.
+    pub default_review_every: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +208,8 @@ pub struct UiConfig {
 
 // --- defaults ---
 
+fn default_kazam_import_folder() -> String { "kazam".into() }
+fn default_kazam_binary() -> String { "kazam".into() }
 fn default_watch_interval() -> u64 { 5 }
 fn default_api_port() -> u16 { 7373 }
 fn default_summarizer_url() -> String { "http://localhost:3000/api".into() }
@@ -359,6 +385,25 @@ impl Default for SummarizerConfig {
     }
 }
 
+impl Default for FreshnessConfig {
+    fn default() -> Self {
+        Self {
+            default_owner: None,
+            default_review_every: None,
+        }
+    }
+}
+
+impl Default for KazamConfig {
+    fn default() -> Self {
+        Self {
+            kb_path: None,
+            import_folder: default_kazam_import_folder(),
+            binary_path: default_kazam_binary(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -371,6 +416,8 @@ impl Default for Config {
             import: ImportConfig::default(),
             meetily: MeetilyConfig::default(),
             summarizer: SummarizerConfig::default(),
+            freshness: FreshnessConfig::default(),
+            kazam: KazamConfig::default(),
         }
     }
 }

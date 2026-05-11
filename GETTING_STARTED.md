@@ -155,6 +155,95 @@ openai_model = "gpt-4o"
 
 ---
 
+## AI Summarizer (optional)
+
+Press `X` (Shift+X) with a note open to generate an AI summary. The summary streams in a full-screen overlay and is automatically inserted into the note's `## Summary` section when complete.
+
+Configure in Settings (`S` key) under **Summarizer**, or directly in `config.toml`:
+
+```toml
+[summarizer]
+base_url = "http://localhost:3000/api"   # any OpenAI-compatible endpoint
+model = "llama3.2"
+api_key = ""                             # leave empty for local endpoints
+```
+
+---
+
+## Freshness tracking (optional)
+
+Track when notes need review by adding a `review_every` field to a note's YAML frontmatter:
+
+```yaml
+---
+title: "Architecture decisions"
+review_every: 30d        # Nd · Nw · Nm · Ny · monthly · quarterly · yearly
+owner: jordan
+expires: 2026-12-31      # optional hard expiry date
+---
+```
+
+The status bar shows a live badge (`FRESH` / `DUE IN Nd` / `OVERDUE Nd` / `EXPIRED Nd`) for the open note. Press `F` (Shift+F) to open the freshness dashboard — a sorted list of all notes with staleness metadata, worst-first.
+
+Default owner and cadence can be set in `config.toml`:
+
+```toml
+[freshness]
+default_owner = "jordan"
+default_review_every = "30d"
+```
+
+---
+
+## Sidecar annotations (optional)
+
+Add non-destructive annotations to any note without editing its content. Annotations are Kazam-compatible YAML files stored alongside your notes in `.annotations/<note-slug>/`.
+
+Press `A` in Normal mode (with a note open) to open the annotations panel:
+
+| Key | Action |
+|-----|--------|
+| `n` | Write a new annotation |
+| `i` | Mark focused annotation as incorporated |
+| `d` | Mark focused annotation as ignored |
+| `j` / `k` | Navigate |
+| `Esc` | Close panel |
+
+The status bar shows `A:<n>` when the open note has pending annotations.
+
+---
+
+## Kazam integration (optional)
+
+noterm integrates with [Kazam](https://github.com/tdiderich/kazam), a local AI-native knowledge base engine. All Kazam features require `kazam.kb_path` to be set in `config.toml`:
+
+```toml
+[kazam]
+kb_path = "~/Documents/my-kb"    # path to your Kazam KB directory
+import_folder = "kazam"          # subfolder in notes_dir for imported pages
+binary_path = "kazam"            # path to the kazam binary (for MCP)
+```
+
+### KB Browser (`B`)
+
+Browse and import Kazam KB pages directly into noterm — no Kazam install required, reads YAML files directly.
+
+Press `B` to open the browser. Type to filter by title, `Enter` to import a page as a markdown note (or open it if already imported), `Esc` to close.
+
+### Export to Kazam (`E`)
+
+Press `E` to export the open note as a Kazam-compatible YAML page written to `<kb_path>/<slug>.yaml`. Kazam picks it up automatically when it rebuilds its static site.
+
+### MCP connection (`M`)
+
+Press `M` to toggle a live connection to `kazam mcp --kb <kb_path>`. When connected, noterm can use Kazam's MCP tools for agent operations. Requires the `kazam` binary on your PATH (or set `binary_path`).
+
+### Chat KB context (`Tab` in chat)
+
+While in the chat panel, press `Tab` to inject all Kazam KB pages into the chat system prompt. The panel border turns cyan and shows `[KB:ON]`. Press `Tab` again to clear the context.
+
+---
+
 ## Git sync (optional)
 
 To sync notes across machines, point `notes_dir` at a git repository and noterm will show live status in the title bar. Use `G` to open the git panel and stage, commit, and push without leaving the TUI.
@@ -172,6 +261,5 @@ git remote add origin https://github.com/yourname/notes.git
 Edit `~/.config/noterm/config.toml`:
 
 ```toml
-[notes]
 notes_dir = "~/Documents/notes"
 ```

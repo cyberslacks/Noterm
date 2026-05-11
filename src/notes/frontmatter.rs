@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SourceOfTruth {
+    pub label: String,
+    pub href: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NoteFrontmatter {
     pub title: Option<String>,
     pub id: Option<String>,
@@ -11,6 +17,12 @@ pub struct NoteFrontmatter {
     pub tags: Option<Vec<String>>,
     pub tasks: Option<Vec<Task>>,
     pub status: Option<String>,
+    // Freshness / review metadata (Kazam-compatible)
+    pub owner: Option<String>,
+    pub review_every: Option<String>,
+    pub expires: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources_of_truth: Option<Vec<SourceOfTruth>>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
 }

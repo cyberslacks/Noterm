@@ -12,11 +12,16 @@ use crate::{
 };
 
 pub fn render(f: &mut Frame, area: Rect, state: &AppState) {
+    let kb_indicator = if state.chat_kazam_context { " [KB:ON]" } else { "" };
     let block = Block::default()
-        .title(" LLM Chat (i=input, Esc=exit, Ctrl+l=clear) ")
+        .title(format!(" LLM Chat{kb_indicator}  Tab=KB · Ctrl+l=clear · Esc=exit "))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Blue));
+        .border_style(Style::default().fg(if state.chat_kazam_context {
+            Color::Cyan
+        } else {
+            Color::Blue
+        }));
 
     let inner = block.inner(area);
     f.render_widget(block, area);

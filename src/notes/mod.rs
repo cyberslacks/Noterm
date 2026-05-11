@@ -1,3 +1,5 @@
+pub mod annotations;
+pub mod freshness;
 pub mod frontmatter;
 pub mod markdown;
 pub mod watcher;

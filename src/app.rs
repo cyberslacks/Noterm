@@ -3,12 +3,19 @@ use ratatui_textarea::TextArea;
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
 
+use std::sync::{Arc, Mutex};
+
 use crate::{
     config::Config,
     git::{GitCommit, GitStatus},
     import::meetily::MeetilyMeeting,
+    kazam::{kb_browser::KazamPage, mcp_client::KazamMcpClient},
     llm::ChatMessage,
-    notes::{FileNode, Note, SearchResult, VectorSearchResult},
+    notes::{
+        annotations::Annotation,
+        freshness::FreshnessEntry,
+        FileNode, Note, SearchResult, VectorSearchResult,
+    },
     tasks::KanbanState,
 };
 
@@ -27,7 +34,10 @@ pub enum Mode {
     ConfirmDelete,  // confirmation overlay before deleting a note
     MeetilyImport,  // Meetily meeting browser overlay
     Settings,       // LLM / provider settings panel
-    Summarize,      // streaming AI summary overlay
+    Summarize,         // streaming AI summary overlay
+    FreshnessView,     // Kazam-style staleness dashboard overlay
+    AnnotationPanel,   // sidecar annotation viewer/composer
+    KazamKbBrowser,    // Kazam KB page browser/importer
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,11 +79,22 @@ pub enum AppEvent {
     NoteDeleted(PathBuf),    // a note was deleted from disk
     MeetilyMeetingsLoaded(Vec<MeetilyMeeting>),
     MeetilyImportDone { path: PathBuf, meetily_id: String },
+    FreshnessListLoaded(Vec<FreshnessEntry>),
+    AnnotationsLoaded { slug: String, entries: Vec<Annotation> },
+    AnnotationSaved(String), // slug — triggers reload
+    KazamItemsLoaded(Vec<KazamPage>),
+    KazamImportDone(PathBuf),
+    KazamExportDone(PathBuf),
+    KazamExportError(String),
+    KazamMcpConnected(Arc<Mutex<KazamMcpClient>>),
+    KazamMcpError(String),
+    KazamKbContextLoaded(Vec<String>),
     ModelsLoaded { ollama: Vec<String>, openai: Vec<String> },
     ForceReembed,
     SummaryChunk(String),
     SummaryDone,
     SummaryError(String),
+    UpdateAvailable(String),
     Error(String),
 }
 
@@ -92,6 +113,62 @@ impl Default for MeetilyPanelState {
             cursor: 0,
             loading: false,
             imported_ids: std::collections::HashSet::new(),
+        }
+    }
+}
+
+pub struct FreshnessPanelState {
+    pub entries: Vec<FreshnessEntry>,
+    pub cursor: usize,
+    pub loading: bool,
+}
+
+impl Default for FreshnessPanelState {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+            loading: false,
+        }
+    }
+}
+
+pub struct AnnotationPanelState {
+    pub entries: Vec<Annotation>,
+    pub cursor: usize,
+    pub input: String,
+    pub composing: bool,
+    pub section_hint: String,
+    pub slug: String,
+}
+
+impl Default for AnnotationPanelState {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+            input: String::new(),
+            composing: false,
+            section_hint: String::new(),
+            slug: String::new(),
+        }
+    }
+}
+
+pub struct KazamKbState {
+    pub entries: Vec<KazamPage>,
+    pub cursor: usize,
+    pub loading: bool,
+    pub filter: String,
+}
+
+impl Default for KazamKbState {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: 0,
+            loading: false,
+            filter: String::new(),
         }
     }
 }
@@ -145,6 +222,24 @@ pub struct AppState {
     // Meetily import panel
     pub meetily: MeetilyPanelState,
 
+    // Freshness / staleness dashboard
+    pub freshness: FreshnessPanelState,
+
+    // Sidecar annotations panel
+    pub annotation: AnnotationPanelState,
+    pub annotation_pending_count: usize,
+
+    // Kazam KB browser
+    pub kazam_kb: KazamKbState,
+
+    // Kazam MCP client (Track B — optional)
+    pub kazam_mcp: Option<Arc<Mutex<KazamMcpClient>>>,
+    pub kazam_mcp_connected: bool,
+
+    // Chat KB context toggle (Track B)
+    pub chat_kazam_context: bool,
+    pub kazam_kb_pages: Vec<String>,
+
     // Settings panel
     pub settings_mode: SettingsMode,
     pub settings_cursor: usize,
@@ -159,8 +254,14 @@ pub struct AppState {
     pub summarize_buf: String,
     pub summarize_scroll: usize,
 
+    // Help panel
+    pub help_scroll: usize,
+
     // Status bar notification
     pub status_message: Option<(String, StatusLevel)>,
+
+    // In-app update notification
+    pub update_available: Option<String>,
 
     // Async event channel (sender cloned into spawned tasks)
     pub tx: UnboundedSender<AppEvent>,
@@ -198,6 +299,14 @@ impl AppState {
             git_commit_msg: String::new(),
             prompt_input: String::new(),
             meetily: MeetilyPanelState::default(),
+            freshness: FreshnessPanelState::default(),
+            annotation: AnnotationPanelState::default(),
+            annotation_pending_count: 0,
+            kazam_kb: KazamKbState::default(),
+            kazam_mcp: None,
+            kazam_mcp_connected: false,
+            chat_kazam_context: false,
+            kazam_kb_pages: Vec::new(),
             settings_mode: SettingsMode::Navigating,
             settings_cursor: 0,
             settings_edit_buf: String::new(),
@@ -208,7 +317,9 @@ impl AppState {
             summarize_loading: false,
             summarize_buf: String::new(),
             summarize_scroll: 0,
+            help_scroll: 0,
             status_message: None,
+            update_available: None,
             config,
             tx,
         }
@@ -336,6 +447,94 @@ impl AppState {
                 });
             }
 
+            AppEvent::FreshnessListLoaded(entries) => {
+                self.freshness.entries = entries;
+                self.freshness.cursor = 0;
+                self.freshness.loading = false;
+            }
+
+            AppEvent::AnnotationsLoaded { slug, entries } => {
+                if self.annotation.slug == slug {
+                    let pending = entries
+                        .iter()
+                        .filter(|a| a.status == crate::notes::annotations::AnnotationStatus::Pending)
+                        .count();
+                    self.annotation.entries = entries;
+                    self.annotation.cursor = 0;
+                    self.annotation.composing = false;
+                    self.annotation.input.clear();
+                    self.annotation_pending_count = pending;
+                }
+            }
+
+            AppEvent::AnnotationSaved(slug) => {
+                let tx = self.tx.clone();
+                let notes_dir = self.notes_dir.clone();
+                let slug2 = slug.clone();
+                tokio::spawn(async move {
+                    let entries = tokio::task::spawn_blocking(move || {
+                        crate::notes::annotations::load_annotations(&notes_dir, &slug2)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    tx.send(AppEvent::AnnotationsLoaded { slug, entries }).ok();
+                });
+            }
+
+            AppEvent::KazamItemsLoaded(pages) => {
+                self.kazam_kb.entries = pages;
+                self.kazam_kb.cursor = 0;
+                self.kazam_kb.loading = false;
+            }
+
+            AppEvent::KazamImportDone(path) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                self.set_status(format!("Imported from Kazam: {name}"), StatusLevel::Success);
+                // Refresh file tree and open the imported note
+                let tx = self.tx.clone();
+                let notes_dir = self.notes_dir.clone();
+                let show_hidden = self.config.ui.show_hidden;
+                tokio::spawn(async move {
+                    let nodes = tokio::task::spawn_blocking(move || {
+                        crate::notes::watcher::scan_dir(&notes_dir, show_hidden)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    tx.send(AppEvent::FileTreeRefresh(nodes)).ok();
+                });
+            }
+
+            AppEvent::KazamExportDone(path) => {
+                self.set_status(
+                    format!("Exported → {}", path.display()),
+                    StatusLevel::Success,
+                );
+            }
+
+            AppEvent::KazamExportError(e) => {
+                self.set_status(format!("Export failed: {e}"), StatusLevel::Error);
+            }
+
+            AppEvent::KazamMcpConnected(client) => {
+                self.kazam_mcp = Some(client);
+                self.kazam_mcp_connected = true;
+                self.set_status("Kazam MCP connected".into(), StatusLevel::Success);
+            }
+
+            AppEvent::KazamMcpError(e) => {
+                self.kazam_mcp = None;
+                self.kazam_mcp_connected = false;
+                self.set_status(format!("Kazam MCP: {e}"), StatusLevel::Error);
+            }
+
+            AppEvent::KazamKbContextLoaded(pages) => {
+                self.kazam_kb_pages = pages;
+                self.set_status(
+                    format!("KB context loaded ({} pages)", self.kazam_kb_pages.len()),
+                    StatusLevel::Info,
+                );
+            }
+
             AppEvent::ModelsLoaded { ollama, openai } => {
                 self.available_ollama_models = ollama;
                 self.available_openai_models = openai;
@@ -364,6 +563,10 @@ impl AppState {
                 if self.mode == Mode::Summarize {
                     self.mode = Mode::Normal;
                 }
+            }
+
+            AppEvent::UpdateAvailable(version) => {
+                self.update_available = Some(version);
             }
 
             AppEvent::Error(e) => {
@@ -442,6 +645,9 @@ impl AppState {
     }
 
     pub fn open_note(&mut self, note: Note) {
+        let slug = crate::notes::annotations::note_slug(&note.path);
+        self.annotation_pending_count =
+            crate::notes::annotations::count_pending(&self.notes_dir, &slug);
         let lines: Vec<String> = note.body.lines().map(String::from).collect();
         self.editor = TextArea::new(lines);
         self.viewer_scroll = 0;

@@ -33,16 +33,16 @@ async fn handle_key(state: &mut AppState, key: KeyEvent) -> Result<Action> {
         Mode::Chat => handle_chat(state, key),
         Mode::Kanban => handle_kanban(state, key),
         Mode::Git => handle_git(state, key),
-        Mode::Help => {
-            state.mode = Mode::Normal;
-            Ok(Action::Continue)
-        }
+        Mode::Help => handle_help(state, key),
         Mode::NewNote => handle_new_note(state, key),
         Mode::GitCommitInput => handle_git_commit_input(state, key),
         Mode::ConfirmDelete => handle_confirm_delete(state, key).await,
         Mode::MeetilyImport => handle_meetily(state, key).await,
         Mode::Settings => handle_settings(state, key),
         Mode::Summarize => handle_summarize(state, key),
+        Mode::FreshnessView => handle_freshness(state, key).await,
+        Mode::AnnotationPanel => handle_annotations(state, key).await,
+        Mode::KazamKbBrowser => handle_kazam_kb(state, key).await,
     }
 }
 
@@ -175,6 +175,149 @@ async fn handle_normal(state: &mut AppState, key: KeyEvent) -> Result<Action> {
                 state.set_status("Open a note first".into(), crate::app::StatusLevel::Warning);
             }
         }
+        KeyCode::Char('E') => {
+            // Export current note to Kazam KB YAML
+            if let Some(note) = &state.current_note {
+                if let Some(kb_path_str) = &state.config.kazam.kb_path {
+                    let kb_path = std::path::PathBuf::from(kb_path_str);
+                    let note_path = note.path.clone();
+                    let body = note.body.clone();
+                    let frontmatter = note.frontmatter.clone();
+                    let tx = state.tx.clone();
+                    state.set_status("Exporting to Kazam KB…".into(), crate::app::StatusLevel::Info);
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::export::kazam::export_note(&note_path, &body, &frontmatter, &kb_path)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(path)) => { tx.send(AppEvent::KazamExportDone(path)).ok(); }
+                            Ok(Err(e)) => { tx.send(AppEvent::KazamExportError(e.to_string())).ok(); }
+                            Err(e) => { tx.send(AppEvent::KazamExportError(e.to_string())).ok(); }
+                        }
+                    });
+                } else {
+                    state.set_status(
+                        "Set kazam.kb_path in config to enable export".into(),
+                        crate::app::StatusLevel::Warning,
+                    );
+                }
+            } else {
+                state.set_status("Open a note first".into(), crate::app::StatusLevel::Warning);
+            }
+        }
+        KeyCode::Char('M') => {
+            // Toggle Kazam MCP connection
+            if state.kazam_mcp_connected {
+                state.kazam_mcp = None;
+                state.kazam_mcp_connected = false;
+                state.kazam_kb_pages.clear();
+                state.chat_kazam_context = false;
+                state.set_status("Kazam MCP disconnected".into(), crate::app::StatusLevel::Info);
+            } else if let Some(kb_path) = &state.config.kazam.kb_path {
+                let binary_path = state.config.kazam.binary_path.clone();
+                let kb_path = kb_path.clone();
+                let tx = state.tx.clone();
+                state.set_status("Connecting to Kazam MCP…".into(), crate::app::StatusLevel::Info);
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::kazam::mcp_client::KazamMcpClient::spawn(&binary_path, &kb_path)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(client)) => {
+                            let wrapped = std::sync::Arc::new(std::sync::Mutex::new(client));
+                            tx.send(AppEvent::KazamMcpConnected(wrapped)).ok();
+                        }
+                        Ok(Err(e)) => { tx.send(AppEvent::KazamMcpError(e.to_string())).ok(); }
+                        Err(e) => { tx.send(AppEvent::KazamMcpError(e.to_string())).ok(); }
+                    }
+                });
+            } else {
+                state.set_status(
+                    "Set kazam.kb_path and kazam.binary_path to use MCP".into(),
+                    crate::app::StatusLevel::Warning,
+                );
+            }
+        }
+        KeyCode::Char('B') => {
+            if let Some(kb_path) = state.config.kazam.kb_path.clone() {
+                let kb_path = std::path::PathBuf::from(&kb_path);
+                if !kb_path.exists() {
+                    state.set_status(
+                        format!("Kazam KB path not found: {}", kb_path.display()),
+                        crate::app::StatusLevel::Error,
+                    );
+                } else {
+                    state.kazam_kb.loading = true;
+                    state.kazam_kb.entries.clear();
+                    state.kazam_kb.cursor = 0;
+                    state.kazam_kb.filter.clear();
+                    state.enter_mode(Mode::KazamKbBrowser);
+                    let tx = state.tx.clone();
+                    let notes_dir = state.notes_dir.clone();
+                    let import_folder = state.config.kazam.import_folder.clone();
+                    tokio::spawn(async move {
+                        let pages = tokio::task::spawn_blocking(move || {
+                            crate::kazam::kb_browser::scan_kb(&kb_path, &notes_dir, &import_folder)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        tx.send(AppEvent::KazamItemsLoaded(pages)).ok();
+                    });
+                }
+            } else {
+                state.set_status(
+                    "Set kazam.kb_path in config to use the KB browser".into(),
+                    crate::app::StatusLevel::Warning,
+                );
+            }
+        }
+        KeyCode::Char('A') => {
+            if let Some(note) = &state.current_note {
+                let slug = crate::notes::annotations::note_slug(&note.path);
+                state.annotation.slug = slug.clone();
+                state.annotation.entries.clear();
+                state.annotation.cursor = 0;
+                state.annotation.composing = false;
+                state.annotation.input.clear();
+                state.enter_mode(Mode::AnnotationPanel);
+                let tx = state.tx.clone();
+                let notes_dir = state.notes_dir.clone();
+                let slug2 = slug.clone();
+                tokio::spawn(async move {
+                    let entries = tokio::task::spawn_blocking(move || {
+                        crate::notes::annotations::load_annotations(&notes_dir, &slug2)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    tx.send(AppEvent::AnnotationsLoaded { slug, entries }).ok();
+                });
+            } else {
+                state.set_status("Open a note first".into(), crate::app::StatusLevel::Warning);
+            }
+        }
+        KeyCode::Char('F') => {
+            state.freshness.loading = true;
+            state.freshness.entries.clear();
+            state.enter_mode(Mode::FreshnessView);
+            let paths: Vec<std::path::PathBuf> = state
+                .file_tree
+                .iter()
+                .filter(|n| !n.is_dir)
+                .map(|n| n.path.clone())
+                .collect();
+            let tx = state.tx.clone();
+            let notes_dir = state.notes_dir.clone();
+            tokio::spawn(async move {
+                let entries = tokio::task::spawn_blocking(move || {
+                    crate::notes::freshness::scan_paths(&paths, &notes_dir)
+                })
+                .await
+                .unwrap_or_default();
+                tx.send(AppEvent::FreshnessListLoaded(entries)).ok();
+            });
+        }
         KeyCode::PageDown => {
             state.viewer_scroll = state.viewer_scroll.saturating_add(10);
         }
@@ -182,6 +325,28 @@ async fn handle_normal(state: &mut AppState, key: KeyEvent) -> Result<Action> {
             state.viewer_scroll = state.viewer_scroll.saturating_sub(10);
         }
         _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+fn handle_help(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.help_scroll = state.help_scroll.saturating_add(1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.help_scroll = state.help_scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            state.help_scroll = state.help_scroll.saturating_add(10);
+        }
+        KeyCode::PageUp => {
+            state.help_scroll = state.help_scroll.saturating_sub(10);
+        }
+        _ => {
+            state.help_scroll = 0;
+            state.mode = Mode::Normal;
+        }
     }
     Ok(Action::Continue)
 }
@@ -369,6 +534,42 @@ fn handle_vsearch(state: &mut AppState, key: KeyEvent) -> Result<Action> {
 fn handle_chat(state: &mut AppState, key: KeyEvent) -> Result<Action> {
     match key.code {
         KeyCode::Esc => state.mode = Mode::Normal,
+        KeyCode::Tab => {
+            state.chat_kazam_context = !state.chat_kazam_context;
+            if state.chat_kazam_context {
+                // Load KB pages in background: prefer direct file scan if kb_path set
+                if let Some(kb_path_str) = state.config.kazam.kb_path.clone() {
+                    let kb_path = std::path::PathBuf::from(&kb_path_str);
+                    let notes_dir = state.notes_dir.clone();
+                    let import_folder = state.config.kazam.import_folder.clone();
+                    let tx = state.tx.clone();
+                    tokio::spawn(async move {
+                        let pages_text = tokio::task::spawn_blocking(move || {
+                            crate::kazam::kb_browser::scan_kb(&kb_path, &notes_dir, &import_folder)
+                                .into_iter()
+                                .filter_map(|p| {
+                                    let content = std::fs::read_to_string(&p.path).ok()?;
+                                    Some(format!("# {}\n\n{content}", p.title))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        .unwrap_or_default();
+                        tx.send(AppEvent::KazamKbContextLoaded(pages_text)).ok();
+                    });
+                    state.set_status("KB context: ON (loading…)".into(), crate::app::StatusLevel::Info);
+                } else {
+                    state.chat_kazam_context = false;
+                    state.set_status(
+                        "Set kazam.kb_path to enable KB context".into(),
+                        crate::app::StatusLevel::Warning,
+                    );
+                }
+            } else {
+                state.kazam_kb_pages.clear();
+                state.set_status("KB context: OFF".into(), crate::app::StatusLevel::Info);
+            }
+        }
         KeyCode::Enter => {
             if !state.chat_input.is_empty() && !state.chat_loading {
                 let msg = state.chat_input.drain(..).collect::<String>();
@@ -634,6 +835,244 @@ async fn handle_meetily(state: &mut AppState, key: KeyEvent) -> Result<Action> {
                         Ok(Err(e)) => { tx.send(AppEvent::Error(format!("Import failed: {e}"))).ok(); }
                         Err(e) => { tx.send(AppEvent::Error(format!("Import task: {e}"))).ok(); }
                     }
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+async fn handle_freshness(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    match key.code {
+        KeyCode::Esc => {
+            state.mode = Mode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            let len = state.freshness.entries.len();
+            if len > 0 && state.freshness.cursor + 1 < len {
+                state.freshness.cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.freshness.cursor = state.freshness.cursor.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if let Some(entry) = state.freshness.entries.get(state.freshness.cursor).cloned() {
+                let notes_dir = state.notes_dir.clone();
+                match crate::notes::Note::from_path(&entry.path, &notes_dir) {
+                    Ok(note) => {
+                        state.open_note(note);
+                        state.mode = Mode::Normal;
+                    }
+                    Err(e) => {
+                        state.set_status(
+                            format!("Could not open note: {e}"),
+                            crate::app::StatusLevel::Error,
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+async fn handle_kazam_kb(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    let filter = state.kazam_kb.filter.to_lowercase();
+    let visible_count = state
+        .kazam_kb
+        .entries
+        .iter()
+        .filter(|p| filter.is_empty() || p.title.to_lowercase().contains(&filter) || p.slug.contains(&filter))
+        .count();
+
+    match key.code {
+        KeyCode::Esc => {
+            state.mode = Mode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if visible_count > 0 && state.kazam_kb.cursor + 1 < visible_count {
+                state.kazam_kb.cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.kazam_kb.cursor = state.kazam_kb.cursor.saturating_sub(1);
+        }
+        KeyCode::Backspace => {
+            state.kazam_kb.filter.pop();
+            state.kazam_kb.cursor = 0;
+        }
+        KeyCode::Enter => {
+            let filter_str = state.kazam_kb.filter.to_lowercase();
+            let selected = state
+                .kazam_kb
+                .entries
+                .iter()
+                .filter(|p| {
+                    filter_str.is_empty()
+                        || p.title.to_lowercase().contains(&filter_str)
+                        || p.slug.contains(&filter_str)
+                })
+                .nth(state.kazam_kb.cursor)
+                .cloned();
+
+            if let Some(page) = selected {
+                let notes_dir = state.notes_dir.clone();
+                let import_folder = state.config.kazam.import_folder.clone();
+                let tx = state.tx.clone();
+
+                if page.already_imported {
+                    // Open the existing note
+                    let import_path = crate::kazam::kb_browser::import_path(
+                        &notes_dir,
+                        &import_folder,
+                        &page.slug,
+                    );
+                    match crate::notes::Note::from_path(&import_path, &notes_dir) {
+                        Ok(note) => {
+                            state.open_note(note);
+                            state.mode = Mode::Normal;
+                        }
+                        Err(e) => {
+                            state.set_status(
+                                format!("Could not open note: {e}"),
+                                crate::app::StatusLevel::Error,
+                            );
+                        }
+                    }
+                } else {
+                    // Import the page
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::kazam::kb_browser::import_page(&page, &notes_dir, &import_folder)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(path)) => { tx.send(AppEvent::KazamImportDone(path)).ok(); }
+                            Ok(Err(e)) => { tx.send(AppEvent::Error(format!("Kazam import: {e}"))).ok(); }
+                            Err(e) => { tx.send(AppEvent::Error(format!("Kazam task: {e}"))).ok(); }
+                        }
+                    });
+                    state.mode = Mode::Normal;
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            state.kazam_kb.filter.push(c);
+            state.kazam_kb.cursor = 0;
+        }
+        _ => {}
+    }
+    Ok(Action::Continue)
+}
+
+async fn handle_annotations(state: &mut AppState, key: KeyEvent) -> Result<Action> {
+    if state.annotation.composing {
+        match key.code {
+            KeyCode::Esc => {
+                state.annotation.composing = false;
+                state.annotation.input.clear();
+            }
+            KeyCode::Enter => {
+                let text = state.annotation.input.drain(..).collect::<String>().trim().to_string();
+                if !text.is_empty() {
+                    let ann = crate::notes::annotations::Annotation {
+                        id: crate::notes::annotations::new_annotation_id(),
+                        text,
+                        author: state
+                            .config
+                            .freshness
+                            .default_owner
+                            .clone()
+                            .unwrap_or_default(),
+                        section: state.annotation.section_hint.clone(),
+                        added: crate::notes::freshness::today_iso(),
+                        status: crate::notes::annotations::AnnotationStatus::Pending,
+                        source: crate::notes::annotations::AnnotationSource::Cli,
+                    };
+                    state.annotation.composing = false;
+                    let slug = state.annotation.slug.clone();
+                    let slug2 = slug.clone();
+                    let notes_dir = state.notes_dir.clone();
+                    let tx = state.tx.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::notes::annotations::save_annotation(&notes_dir, &slug2, &ann)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(())) => {
+                                tx.send(AppEvent::AnnotationSaved(slug)).ok();
+                            }
+                            Ok(Err(e)) => {
+                                tx.send(AppEvent::Error(format!("Annotation save: {e}"))).ok();
+                            }
+                            Err(e) => {
+                                tx.send(AppEvent::Error(format!("Annotation task: {e}"))).ok();
+                            }
+                        }
+                    });
+                }
+            }
+            KeyCode::Char(c) => state.annotation.input.push(c),
+            KeyCode::Backspace => { state.annotation.input.pop(); }
+            _ => {}
+        }
+        return Ok(Action::Continue);
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.mode = Mode::Normal;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            let len = state.annotation.entries.len();
+            if len > 0 && state.annotation.cursor + 1 < len {
+                state.annotation.cursor += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.annotation.cursor = state.annotation.cursor.saturating_sub(1);
+        }
+        KeyCode::Char('n') => {
+            state.annotation.input.clear();
+            state.annotation.composing = true;
+        }
+        KeyCode::Char('i') => {
+            if let Some(ann) = state.annotation.entries.get(state.annotation.cursor).cloned() {
+                let mut updated = ann.clone();
+                updated.status = crate::notes::annotations::AnnotationStatus::Incorporated;
+                let slug = state.annotation.slug.clone();
+                let slug2 = slug.clone();
+                let notes_dir = state.notes_dir.clone();
+                let tx = state.tx.clone();
+                tokio::spawn(async move {
+                    tokio::task::spawn_blocking(move || {
+                        crate::notes::annotations::save_annotation(&notes_dir, &slug2, &updated).ok();
+                    })
+                    .await
+                    .ok();
+                    tx.send(AppEvent::AnnotationSaved(slug)).ok();
+                });
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(ann) = state.annotation.entries.get(state.annotation.cursor).cloned() {
+                let mut updated = ann.clone();
+                updated.status = crate::notes::annotations::AnnotationStatus::Ignored;
+                let slug = state.annotation.slug.clone();
+                let slug2 = slug.clone();
+                let notes_dir = state.notes_dir.clone();
+                let tx = state.tx.clone();
+                tokio::spawn(async move {
+                    tokio::task::spawn_blocking(move || {
+                        crate::notes::annotations::save_annotation(&notes_dir, &slug2, &updated).ok();
+                    })
+                    .await
+                    .ok();
+                    tx.send(AppEvent::AnnotationSaved(slug)).ok();
                 });
             }
         }
